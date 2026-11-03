@@ -10,17 +10,28 @@ class HybridBluetoothAdapter(
     val android: AndroidBluetoothAdapter,
     /** USB dongle stack; preferred for data channels when plugged in. */
     val usbDongle: UsbBtBluetoothAdapter? = null,
+    /**
+     * src14 (nissan custom line): the driver's manual Bluetooth-source
+     * override. When this returns false the dongle is excluded from every
+     * connection decision below, as if it were not plugged in. Defaults to
+     * always-allowed so existing constructions keep the automatic behaviour.
+     */
+    private val usbAllowed: () -> Boolean = { true },
 ) : CarPlayBluetooth {
 
     companion object {
         private const val TAG = "HybridBluetoothAdapter"
     }
 
+    /** The dongle is present *and* the manual override lets CarPlay use it. */
+    private fun dongleUsable(): Boolean = usbDongle?.isSupported() == true && usbAllowed()
+
     override fun isSupported(): Boolean =
         hsae.isSupported() || android.isSupported() || usbDongle?.isSupported() == true
 
     override fun isEnabled(): Boolean {
-        if (usbDongle?.isSupported() == true) return usbDongle.isEnabled()
+        val dongle = usbDongle
+        if (dongle?.isSupported() == true && usbAllowed()) return dongle.isEnabled()
         if (hsae.isSupported() && hsae.isEnabled()) return true
         return android.isEnabled()
     }
@@ -35,8 +46,9 @@ class HybridBluetoothAdapter(
         // ran when neither HSAE nor Android existed, so on T3 (HSAE present
         // but audio-only) the dongle was never enabled and wireless could
         // never reach it (P0-1). Plugging in a dongle is itself the opt-in.
-        if (usbDongle?.isSupported() == true) {
-            return usbDongle.enable()
+        val dongle = usbDongle
+        if (dongle?.isSupported() == true && usbAllowed()) {
+            return dongle.enable()
         }
         return ok
     }
@@ -49,7 +61,7 @@ class HybridBluetoothAdapter(
         val parts = mutableListOf<String>()
         if (hsae.isSupported()) parts.add("HSAE")
         if (android.isSupported()) parts.add("Android")
-        if (usbDongle?.isSupported() == true) parts.add("USB")
+        if (dongleUsable()) parts.add("USB")
         return if (parts.isEmpty()) android.getAdapterName()
         else "Hybrid(${parts.joinToString("+")})"
     }
@@ -68,14 +80,17 @@ class HybridBluetoothAdapter(
         }
         if (hsae.isSupported()) runCatching { addAll(hsae.getPairedDevices()) }
         runCatching { addAll(android.getPairedDevices()) }
-        usbDongle?.let { runCatching { addAll(it.getPairedDevices()) } }
+        // Manual override (src14): a forced built-in source also hides the
+        // dongle's paired devices, so the iPhone is chosen on the built-in
+        // adapter it will actually be reached through.
+        if (usbAllowed()) usbDongle?.let { runCatching { addAll(it.getPairedDevices()) } }
         return merged
     }
 
     override fun getConnectedDevice(): CarPlayBluetoothDevice? {
         // Dongle first: it is the data-capable stack. HSAE may report a
         // connected audio-only device that cannot carry iAP2.
-        usbDongle?.let { runCatching { it.getConnectedDevice() } }?.getOrNull()?.let { return it }
+        if (dongleUsable()) usbDongle?.let { runCatching { it.getConnectedDevice() } }?.getOrNull()?.let { return it }
         android.getConnectedDevice()?.let { return it }
         if (hsae.isSupported()) {
             runCatching { hsae.getConnectedDevice() }.getOrNull()?.let { return it }
@@ -87,7 +102,7 @@ class HybridBluetoothAdapter(
         // Dongle first: its BD_ADDR is the one the iPhone must pair with for
         // the data channel. Falling back to HSAE's address would pair the
         // iPhone to the audio-only module.
-        usbDongle?.let { runCatching { it.localAddress(context) } }?.getOrNull()
+        if (dongleUsable()) usbDongle?.let { runCatching { it.localAddress(context) } }?.getOrNull()
             ?.takeIf { !it.isNullOrBlank() }?.let { return it }
         if (hsae.isSupported()) {
             val hsaeAddr = hsae.localAddress(context)
@@ -99,7 +114,7 @@ class HybridBluetoothAdapter(
 
     override fun openRfcommStream(deviceAddress: String, uuid: String): BlockingDuplexByteStream {
         val dongle = usbDongle
-        if (dongle?.isSupported() == true) {
+        if (dongle?.isSupported() == true && usbAllowed()) {
             if (!dongle.isEnabled()) throw java.io.IOException("USB Bluetooth not enabled")
             // An iAP2 advertisement and bond belong to one local adapter address.
             // Switching to GOC/HSAE cannot resume the dongle's connection.

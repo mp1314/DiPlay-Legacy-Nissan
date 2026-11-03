@@ -3709,7 +3709,10 @@ class CarPlayController(
     private fun selectWirelessBluetoothDevice(adapter: BluetoothAdapter): BluetoothDevice {
         val hybridBt = CarPlayBluetoothManager.get(appContext)
         val usbDongle = hybridBt.usbDongle
-        val dongleActive = usbDongle != null && usbDongle.isEnabled()
+        // src14 (nissan custom line): a forced built-in source must not pick
+        // the wireless device from the dongle's lists either.
+        val dongleActive = usbDongle != null && usbDongle.isEnabled() &&
+            com.shilapi.xcertplay.bluetooth.BluetoothSourceOverride.usbAllowed(appContext)
 
         if (dongleActive) {
             val connected = usbDongle.getConnectedDevice()
