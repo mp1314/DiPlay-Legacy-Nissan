@@ -17,7 +17,7 @@ class HybridBluetoothAdapter(
      * always-allowed so existing constructions keep the automatic behaviour.
      */
     private val usbAllowed: () -> Boolean = { true },
-) : CarPlayBluetooth {
+) : CarPlayBluetooth, CarPlayBluetoothDiscovery {
 
     companion object {
         private const val TAG = "HybridBluetoothAdapter"
@@ -111,6 +111,42 @@ class HybridBluetoothAdapter(
         android.localAddress(context)?.let { return it }
         return null
     }
+
+    // ------------------------------------------------------------------
+    // CarPlayBluetoothDiscovery (src15): "car finds phone" lives only on
+    // the USB dongle stack. The manual source override gates it exactly
+    // like every other dongle decision: a forced built-in source means
+    // the dongle does not exist as far as callers are concerned.
+    // ------------------------------------------------------------------
+
+    override fun isDiscoverySupported(): Boolean = dongleUsable()
+
+    override fun startDiscovery(
+        onDevice: (DiscoveredBluetoothDevice) -> Unit,
+        onFinished: (cancelled: Boolean) -> Unit,
+    ): Boolean {
+        val dongle = usbDongle ?: return false
+        if (!dongleUsable()) return false
+        return dongle.startDiscovery(onDevice, onFinished)
+    }
+
+    override fun stopDiscovery() {
+        usbDongle?.stopDiscovery()
+    }
+
+    override fun isDiscoveryActive(): Boolean = usbDongle?.isDiscoveryActive() == true
+
+    override fun pairDevice(address: String): BluetoothPairResult {
+        val dongle = usbDongle
+            ?: return BluetoothPairResult.Failed("USB Bluetooth unavailable")
+        if (!dongleUsable()) return BluetoothPairResult.Failed("USB Bluetooth unavailable")
+        return dongle.pairDevice(address)
+    }
+
+    override fun isPaired(address: String): Boolean = usbDongle?.isPaired(address) == true
+
+    override fun pairedDevices(): List<CarPlayBluetoothDevice> =
+        if (usbAllowed()) usbDongle?.getPairedDevices().orEmpty() else emptyList()
 
     override fun openRfcommStream(deviceAddress: String, uuid: String): BlockingDuplexByteStream {
         val dongle = usbDongle

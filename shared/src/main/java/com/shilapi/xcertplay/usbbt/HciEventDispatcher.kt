@@ -35,7 +35,10 @@ internal class HciEventDispatcher(
                 opcode == HciProtocol.OP_ACCEPT_CONNECTION_REQUEST ||
                 opcode == HciProtocol.OP_DISCONNECT ||
                 opcode == HciProtocol.OP_AUTHENTICATION_REQUESTED ||
-                opcode == HciProtocol.OP_SET_CONNECTION_ENCRYPTION,
+                opcode == HciProtocol.OP_SET_CONNECTION_ENCRYPTION ||
+                // HCI_Inquiry (src15) also ends with Command Status only;
+                // its results and Inquiry Complete stream through the queue.
+                opcode == HciProtocol.OP_INQUIRY,
         )
         synchronized(pendingLock) {
             if (!running.get()) return Result.failure(IOException("HCI event reader is closed"))

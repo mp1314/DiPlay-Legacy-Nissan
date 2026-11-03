@@ -9,18 +9,27 @@ import android.hardware.usb.UsbManager
 import android.os.Build
 import com.shilapi.xcertplay.compat.realSdkInt
 import android.util.Log
+import com.shilapi.xcertplay.bluetooth.BluetoothPairResult
 import com.shilapi.xcertplay.bluetooth.CarPlayBluetooth
 import com.shilapi.xcertplay.bluetooth.CarPlayBluetoothDevice
+import com.shilapi.xcertplay.bluetooth.CarPlayBluetoothDiscovery
+import com.shilapi.xcertplay.bluetooth.DiscoveredBluetoothDevice
 import com.shilapi.xcertplay.transport.BlockingDuplexByteStream
 import com.shilapi.xcertplay.usbbt.HciProtocol.EVT_AUTHENTICATION_COMPLETE
 import com.shilapi.xcertplay.usbbt.HciProtocol.EVT_CONNECTION_COMPLETE
 import com.shilapi.xcertplay.usbbt.HciProtocol.EVT_CONNECTION_REQUEST
 import com.shilapi.xcertplay.usbbt.HciProtocol.EVT_DISCONNECTION_COMPLETE
 import com.shilapi.xcertplay.usbbt.HciProtocol.EVT_ENCRYPTION_CHANGE
+import com.shilapi.xcertplay.usbbt.HciProtocol.EVT_EXTENDED_INQUIRY_RESULT
+import com.shilapi.xcertplay.usbbt.HciProtocol.EVT_INQUIRY_COMPLETE
+import com.shilapi.xcertplay.usbbt.HciProtocol.EVT_INQUIRY_RESULT
+import com.shilapi.xcertplay.usbbt.HciProtocol.EVT_INQUIRY_RESULT_WITH_RSSI
 import com.shilapi.xcertplay.usbbt.HciProtocol.OP_ACCEPT_CONNECTION_REQUEST
 import com.shilapi.xcertplay.usbbt.HciProtocol.OP_AUTHENTICATION_REQUESTED
 import com.shilapi.xcertplay.usbbt.HciProtocol.OP_CREATE_CONNECTION
 import com.shilapi.xcertplay.usbbt.HciProtocol.OP_DISCONNECT
+import com.shilapi.xcertplay.usbbt.HciProtocol.OP_INQUIRY
+import com.shilapi.xcertplay.usbbt.HciProtocol.OP_INQUIRY_CANCEL
 import com.shilapi.xcertplay.usbbt.HciProtocol.OP_RESET
 import com.shilapi.xcertplay.usbbt.HciProtocol.OP_SET_CONNECTION_ENCRYPTION
 import com.shilapi.xcertplay.usbbt.HciProtocol.OP_WRITE_SCAN_ENABLE
@@ -29,10 +38,15 @@ import com.shilapi.xcertplay.usbbt.HciProtocol.encodeAuthenticationRequested
 import com.shilapi.xcertplay.usbbt.HciProtocol.encodeBdAddr
 import com.shilapi.xcertplay.usbbt.HciProtocol.encodeCreateConnection
 import com.shilapi.xcertplay.usbbt.HciProtocol.encodeDisconnect
+import com.shilapi.xcertplay.usbbt.HciProtocol.encodeInquiry
 import com.shilapi.xcertplay.usbbt.HciProtocol.encodeSetConnectionEncryption
 import com.shilapi.xcertplay.usbbt.HciProtocol.parseConnectionComplete
 import com.shilapi.xcertplay.usbbt.HciProtocol.parseConnectionRequest
 import com.shilapi.xcertplay.usbbt.HciProtocol.parseDisconnectionComplete
+import com.shilapi.xcertplay.usbbt.HciProtocol.parseExtendedInquiryResult
+import com.shilapi.xcertplay.usbbt.HciProtocol.parseInquiryComplete
+import com.shilapi.xcertplay.usbbt.HciProtocol.parseInquiryResult
+import com.shilapi.xcertplay.usbbt.HciProtocol.parseInquiryResultWithRssi
 import java.io.Closeable
 import java.io.IOException
 import java.util.UUID
@@ -62,7 +76,7 @@ import java.util.concurrent.atomic.AtomicInteger
  */
 class UsbBtBluetoothAdapter(
     private val appContext: Context,
-) : CarPlayBluetooth {
+) : CarPlayBluetooth, CarPlayBluetoothDiscovery {
 
     companion object {
         private const val TAG = "UsbBtBluetoothAdapter"
@@ -70,6 +84,10 @@ class UsbBtBluetoothAdapter(
         private const val FALLBACK_IAP2_CHANNEL = 1
         /** Issue #281: result=0x4 rejections on one ACL before it is force-dropped. */
         private const val STALE_ACL_REJECTION_LIMIT = 2
+        /** src15: HCI_Inquiry length in 1.28 s units: 9 ≈ 11.5 s of scanning. */
+        private const val INQUIRY_LENGTH_UNITS = 0x09
+        /** src15: grace window for the pairing agent to persist a fresh link key. */
+        private const val LINK_KEY_GRACE_MS = 2_000L
     }
 
     private val usbManager: UsbManager? =
@@ -719,6 +737,155 @@ class UsbBtBluetoothAdapter(
     }
 
     // ------------------------------------------------------------------
+    // Discovery (HCI Inquiry) + outgoing pairing (src15, "car finds phone").
+    //
+    // Attach points were chosen to leave every existing path untouched:
+    // inquiry results arrive on the event pump, which previously dropped
+    // those event codes; pairing reuses createAclConnection +
+    // authenticateAndEncrypt verbatim — the SSP exchange that follows is
+    // answered by the same pairing agent as for peer-initiated pairing,
+    // and the resulting link key lands in the same store, so a device
+    // paired here is indistinguishable from one paired the old way.
+    // ------------------------------------------------------------------
+
+    /** One running inquiry: callbacks plus the per-run dedupe table. */
+    private class InquirySession(
+        val onDevice: (DiscoveredBluetoothDevice) -> Unit,
+        val onFinished: (cancelled: Boolean) -> Unit,
+    ) {
+        val seen = LinkedHashMap<String, DiscoveredBluetoothDevice>()
+        val finishedNotified = AtomicBoolean(false)
+    }
+
+    private val inquiryLock = Any()
+    private var inquirySession: InquirySession? = null
+
+    override fun isDiscoverySupported(): Boolean = isSupported()
+
+    override fun isDiscoveryActive(): Boolean =
+        synchronized(inquiryLock) { inquirySession != null }
+
+    override fun startDiscovery(
+        onDevice: (DiscoveredBluetoothDevice) -> Unit,
+        onFinished: (cancelled: Boolean) -> Unit,
+    ): Boolean {
+        val h = synchronized(lock) { hci } ?: return false
+        if (!isEnabled()) return false
+        val session = InquirySession(onDevice, onFinished)
+        synchronized(inquiryLock) {
+            if (inquirySession != null) return false
+            inquirySession = session
+        }
+        val result = h.sendCommand(OP_INQUIRY, encodeInquiry(inquiryLength = INQUIRY_LENGTH_UNITS))
+        if (result is UsbBtHci.HciResult.Failed) {
+            synchronized(inquiryLock) { if (inquirySession === session) inquirySession = null }
+            UsbBtLog.warn(appContext, TAG, "HCI_Inquiry failed to start: ${result.reason}")
+            return false
+        }
+        UsbBtLog.log(appContext, TAG, "HCI_Inquiry started (lengthUnits=$INQUIRY_LENGTH_UNITS)")
+        return true
+    }
+
+    override fun stopDiscovery() {
+        val session = synchronized(inquiryLock) { inquirySession } ?: return
+        val h = synchronized(lock) { hci }
+        if (h != null) {
+            runCatching { h.sendCommand(OP_INQUIRY_CANCEL) }
+                .onFailure { UsbBtLog.warn(appContext, TAG, "HCI_Inquiry_Cancel failed", it) }
+        }
+        finishInquiry(session, cancelled = true)
+    }
+
+    private fun finishInquiry(session: InquirySession, cancelled: Boolean) {
+        synchronized(inquiryLock) { if (inquirySession === session) inquirySession = null }
+        if (session.finishedNotified.compareAndSet(false, true)) {
+            runCatching { session.onFinished(cancelled) }
+        }
+    }
+
+    /** Pump-side: merge one batch of inquiry results into the running session. */
+    private fun onInquiryDevices(devices: List<HciProtocol.InquiryDevice>) {
+        if (devices.isEmpty()) return
+        val session = synchronized(inquiryLock) { inquirySession } ?: return
+        for (device in devices) {
+            val key = device.address.uppercase()
+            if (key.isEmpty()) continue
+            val previous = session.seen[key]
+            val merged = DiscoveredBluetoothDevice(
+                address = key,
+                name = device.name ?: previous?.name,
+                rssi = device.rssi ?: previous?.rssi,
+                classOfDevice = device.classOfDevice,
+            )
+            session.seen[key] = merged
+            // Report a device when it first appears, and once more if its
+            // name only becomes known in a later result (EIR arrives in a
+            // separate event on some controllers).
+            if (previous == null || (previous.name == null && merged.name != null)) {
+                runCatching { session.onDevice(merged) }
+            }
+        }
+    }
+
+    /** Pump-side: the controller reports the inquiry is over. */
+    private fun onInquiryComplete(status: Int) {
+        val session = synchronized(inquiryLock) { inquirySession } ?: return
+        UsbBtLog.log(
+            appContext, TAG,
+            "HCI_Inquiry complete status=0x${status.toString(16)} found=${session.seen.size}",
+        )
+        finishInquiry(session, cancelled = false)
+    }
+
+    override fun isPaired(address: String): Boolean =
+        linkKeys.peers().any { it.equals(address, ignoreCase = true) }
+
+    override fun pairedDevices(): List<CarPlayBluetoothDevice> = getPairedDevices()
+
+    override fun pairDevice(address: String): BluetoothPairResult {
+        val h = synchronized(lock) { hci }
+            ?: return BluetoothPairResult.Failed("USB Bluetooth not enabled")
+        if (!isEnabled()) return BluetoothPairResult.Failed("USB Bluetooth not enabled")
+        if (isPaired(address)) return BluetoothPairResult.Success
+        // A controller cannot page reliably while an inquiry is running;
+        // stop it first (the pairing page does the same for the built-in
+        // stack before createBond).
+        if (isDiscoveryActive()) stopDiscovery()
+        return try {
+            val handle = createAclConnection(h, address)
+            try {
+                authenticateAndEncrypt(h, handle)
+            } finally {
+                // Pairing is complete once the link key exists; drop our ACL
+                // reference so the link closes unless a CarPlay stream also
+                // holds it.
+                releaseAclRef(handle)
+            }
+            // Link_Key_Notification reaches the pairing agent on its own
+            // thread and may land just after authentication completes; give
+            // it a short grace window before judging the outcome.
+            val deadline = System.currentTimeMillis() + LINK_KEY_GRACE_MS
+            while (!isPaired(address) && System.currentTimeMillis() < deadline) {
+                try {
+                    Thread.sleep(100)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    break
+                }
+            }
+            if (isPaired(address)) {
+                UsbBtLog.log(appContext, TAG, "outgoing pairing succeeded for $address")
+                BluetoothPairResult.Success
+            } else {
+                BluetoothPairResult.Failed("no link key stored after authentication")
+            }
+        } catch (e: Exception) {
+            UsbBtLog.warn(appContext, TAG, "outgoing pairing failed for $address", e)
+            BluetoothPairResult.Failed(e.message ?: e.javaClass.simpleName)
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Event / ACL pump.
     // ------------------------------------------------------------------
 
@@ -820,6 +987,14 @@ class UsbBtBluetoothAdapter(
                             encryptLatches[handle]?.countDown()
                         }
                     }
+                    // src15: inquiry results feed only the running discovery
+                    // session; with none active they are dropped exactly as
+                    // before this code existed (the branches did not exist).
+                    EVT_INQUIRY_RESULT -> onInquiryDevices(parseInquiryResult(event))
+                    EVT_INQUIRY_RESULT_WITH_RSSI -> onInquiryDevices(parseInquiryResultWithRssi(event))
+                    EVT_EXTENDED_INQUIRY_RESULT -> onInquiryDevices(parseExtendedInquiryResult(event))
+                    EVT_INQUIRY_COMPLETE ->
+                        parseInquiryComplete(event)?.let { onInquiryComplete(it) }
                     EVT_DISCONNECTION_COMPLETE -> {
                         val dc = parseDisconnectionComplete(event)
                         if (dc != null && dc.status == 0) {
@@ -892,6 +1067,10 @@ class UsbBtBluetoothAdapter(
         val closingPairingAgent = pairingAgent
         pairingAgent = null
         closingPairingAgent?.stop()
+
+        // src15: an inquiry that outlives the pump would leave its listener
+        // waiting forever; finish it as cancelled before the threads stop.
+        synchronized(inquiryLock) { inquirySession }?.let { finishInquiry(it, cancelled = true) }
 
         // Keep the HCI dispatcher and ACL path alive while RFCOMM sends DISC and
         // outstanding links are disconnected. Closing HCI first silently drops

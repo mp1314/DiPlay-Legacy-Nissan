@@ -534,6 +534,154 @@ object HciProtocol {
             0x13,
         )
 
+    // ------------------------------------------------------------------
+    // HCI Inquiry ("car finds phone" discovery, src15). Core Spec Vol 4,
+    // Part E, 7.1: the controller scans for nearby BR/EDR devices and
+    // reports them through the result events parsed below. Which result
+    // event a controller emits depends on Write_Inquiry_Mode (init sets
+    // mode 2, so Extended Inquiry Result is expected; the RSSI and
+    // standard forms cover controllers that ignore the mode write).
+    // ------------------------------------------------------------------
+    const val EVT_INQUIRY_COMPLETE = 0x01
+    const val EVT_INQUIRY_RESULT = 0x02
+    const val EVT_INQUIRY_RESULT_WITH_RSSI = 0x22
+    const val EVT_EXTENDED_INQUIRY_RESULT = 0x2F
+
+    val OP_INQUIRY = opcode(0x01, 0x0001)
+    val OP_INQUIRY_CANCEL = opcode(0x01, 0x0002)
+
+    /** General Inquiry Access Code: the LAP every discoverable device listens on. */
+    const val LAP_GIAC = 0x9E8B33
+
+    /**
+     * Encode HCI_Inquiry params: LAP (3 bytes, LSB first) |
+     * Inquiry_Length (1, in 1.28 s units) | Num_Responses (1, 0 = unlimited).
+     */
+    fun encodeInquiry(
+        lap: Int = LAP_GIAC,
+        inquiryLength: Int = 0x08,
+        numResponses: Int = 0,
+    ): ByteArray = byteArrayOf(
+        (lap and 0xFF).toByte(),
+        ((lap ushr 8) and 0xFF).toByte(),
+        ((lap ushr 16) and 0xFF).toByte(),
+        (inquiryLength and 0xFF).toByte(),
+        (numResponses and 0xFF).toByte(),
+    )
+
+    /** One device found by an inquiry, merged from any of the result events. */
+    data class InquiryDevice(
+        val address: String,
+        val name: String?,
+        val rssi: Int?,
+        val classOfDevice: Int,
+    )
+
+    private fun inquiryCod(params: ByteArray, at: Int): Int =
+        (params[at].toInt() and 0xFF) or
+            ((params[at + 1].toInt() and 0xFF) shl 8) or
+            ((params[at + 2].toInt() and 0xFF) shl 16)
+
+    /**
+     * Parse Inquiry Result (0x02): Num_Responses(1), then per response
+     * BD_ADDR(6) | Page_Scan_Repetition_Mode(1) | Reserved(2) |
+     * Class_of_Device(3) | Clock_Offset(2) — 14 bytes each. Truncated
+     * tails are dropped rather than failing the whole event.
+     */
+    fun parseInquiryResult(event: HciEvent): List<InquiryDevice> {
+        if (event.code != EVT_INQUIRY_RESULT || event.params.isEmpty()) return emptyList()
+        val count = event.params[0].toInt() and 0xFF
+        val complete = minOf(count, (event.params.size - 1) / 14)
+        return (0 until complete).map { i ->
+            val at = 1 + i * 14
+            InquiryDevice(
+                address = parseBdAddrBytes(event.params, at) ?: "",
+                name = null,
+                rssi = null,
+                classOfDevice = inquiryCod(event.params, at + 9),
+            )
+        }.filter { it.address.isNotEmpty() }
+    }
+
+    /**
+     * Parse Inquiry Result with RSSI (0x22): same 14-byte records as the
+     * standard result, then one signed RSSI byte per response appended
+     * after the last record.
+     */
+    fun parseInquiryResultWithRssi(event: HciEvent): List<InquiryDevice> {
+        if (event.code != EVT_INQUIRY_RESULT_WITH_RSSI || event.params.isEmpty()) return emptyList()
+        val count = event.params[0].toInt() and 0xFF
+        val complete = minOf(count, (event.params.size - 1) / 14)
+        val rssiBase = 1 + count * 14
+        return (0 until complete).map { i ->
+            val at = 1 + i * 14
+            InquiryDevice(
+                address = parseBdAddrBytes(event.params, at) ?: "",
+                name = null,
+                rssi = if (rssiBase + i < event.params.size) event.params[rssiBase + i].toInt() else null,
+                classOfDevice = inquiryCod(event.params, at + 9),
+            )
+        }.filter { it.address.isNotEmpty() }
+    }
+
+    /**
+     * Parse Extended Inquiry Result (0x2F): Num_Responses(1), then per
+     * response BD_ADDR(6) | Page_Scan_Repetition_Mode(1) | Reserved(1) |
+     * Class_of_Device(3) | Clock_Offset(2) | RSSI(1) | EIR data(240) —
+     * 254 bytes each. The device name comes from the EIR Complete /
+     * Shortened Local Name entries when present.
+     */
+    fun parseExtendedInquiryResult(event: HciEvent): List<InquiryDevice> {
+        if (event.code != EVT_EXTENDED_INQUIRY_RESULT || event.params.isEmpty()) return emptyList()
+        val count = event.params[0].toInt() and 0xFF
+        val complete = minOf(count, (event.params.size - 1) / 254)
+        return (0 until complete).map { i ->
+            val at = 1 + i * 254
+            val eirStart = at + 14
+            val eirEnd = minOf(eirStart + 240, event.params.size)
+            InquiryDevice(
+                address = parseBdAddrBytes(event.params, at) ?: "",
+                name = if (eirEnd > eirStart) {
+                    parseEirLocalName(event.params.copyOfRange(eirStart, eirEnd))
+                } else null,
+                rssi = event.params[at + 13].toInt(),
+                classOfDevice = inquiryCod(event.params, at + 8),
+            )
+        }.filter { it.address.isNotEmpty() }
+    }
+
+    /**
+     * Extract the local name from EIR data: a sequence of
+     * length(1) | type(1) | data(length-1) structures. Type 0x09 is the
+     * Complete Local Name, 0x08 the Shortened Local Name; the complete
+     * form wins. Returns null when no usable name is present.
+     */
+    fun parseEirLocalName(eirData: ByteArray): String? {
+        var offset = 0
+        var shortened: String? = null
+        while (offset + 2 <= eirData.size) {
+            val length = eirData[offset].toInt() and 0xFF
+            if (length == 0 || offset + 1 + length > eirData.size) break
+            val type = eirData[offset + 1].toInt() and 0xFF
+            if (type == 0x09 || type == 0x08) {
+                val name = String(eirData, offset + 2, length - 1, Charsets.UTF_8)
+                    .trimEnd('\u0000').trim()
+                if (name.isNotEmpty()) {
+                    if (type == 0x09) return name
+                    if (shortened == null) shortened = name
+                }
+            }
+            offset += 1 + length
+        }
+        return shortened
+    }
+
+    /** Parse Inquiry Complete (0x01): Status(1). Null when malformed. */
+    fun parseInquiryComplete(event: HciEvent): Int? {
+        if (event.code != EVT_INQUIRY_COMPLETE || event.params.isEmpty()) return null
+        return event.params[0].toInt() and 0xFF
+    }
+
     /** Encode Link_Key_Request_Reply: BD_ADDR(6 LE) | Link_Key(16). */
     fun encodeLinkKeyReply(addrBytes: ByteArray, linkKey: ByteArray): ByteArray {
         require(addrBytes.size == 6) { "BD_ADDR must be 6 bytes" }

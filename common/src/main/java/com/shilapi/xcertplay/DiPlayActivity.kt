@@ -59,8 +59,13 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.shilapi.xcertplay.adb.LocalAdb
 import com.shilapi.xcertplay.bluetooth.BluetoothAddressResolver
+import com.shilapi.xcertplay.bluetooth.BluetoothPairResult
 import com.shilapi.xcertplay.bluetooth.BluetoothSourceOverride
+import com.shilapi.xcertplay.bluetooth.CarPlayBluetoothDiscovery
 import com.shilapi.xcertplay.bluetooth.CarPlayBluetoothManager
+// Aliased: DiPlayActivity has its own nested DiscoveredBluetoothDevice
+// (connection setup); this one is the shared discovery model (src15).
+import com.shilapi.xcertplay.bluetooth.DiscoveredBluetoothDevice as UsbDiscoveredDevice
 import com.shilapi.xcertplay.usbbt.UsbBtDongleDetector
 import com.shilapi.xcertplay.airplay.CarPlayClusterDisplay
 import com.shilapi.xcertplay.airplay.CarPlayDisplayScale
@@ -189,6 +194,17 @@ class DiPlayActivity : ComponentActivity() {
     private var btPairScanStateText: TextView? = null
     private var btPairPairedList: LinearLayout? = null
     private var btPairNearbyList: LinearLayout? = null
+    // src15: btpair 页来源分段（false=原车蓝牙，true=外置蓝牙 USB 棒）与车找手机会话状态。
+    private var btPairUsbMode = false
+    private var btPairUsbNearby = LinkedHashMap<String, UsbDiscoveredDevice>()
+    private var btPairUsbBonding = mutableSetOf<String>()
+    private var btPairUsbFailed = mutableSetOf<String>()
+    @Volatile private var btPairUsbScanning = false
+    private var btPairUsbStatusText: TextView? = null
+    private var btPairUsbScanStateText: TextView? = null
+    private var btPairUsbSearchButton: Button? = null
+    private var btPairUsbPairedList: LinearLayout? = null
+    private var btPairUsbNearbyList: LinearLayout? = null
     private var lastRunning: Boolean? = null
     private var pendingWireless = false
     private var initialLaunch = true
@@ -572,6 +588,8 @@ class DiPlayActivity : ComponentActivity() {
         speedValueLabel = null
         lyricBlock = null; lyricCurrentLabel = null; lyricNextLabel = null
         btPairStatusText = null; btPairScanStateText = null; btPairPairedList = null; btPairNearbyList = null
+        btPairUsbStatusText = null; btPairUsbScanStateText = null; btPairUsbSearchButton = null
+        btPairUsbPairedList = null; btPairUsbNearbyList = null
         reconnectBar = null
         readinessCard = null
         exportButton = null
@@ -1184,6 +1202,32 @@ class DiPlayActivity : ComponentActivity() {
 
     @SuppressLint("MissingPermission")
     private fun btPairPage(content: LinearLayout) {
+        // src15: 顶部分段切换本页的操作对象（原车蓝牙 / 外置蓝牙）。切换只
+        // 换操作对象并停掉另一侧的搜索，不影响已建立的 CarPlay 连接；
+        // 默认停在原车蓝牙（src13 的既有行为）。
+        val segment = row().apply { gravity = Gravity.CENTER_VERTICAL }
+        segment.addView(button(getString(R.string.bt_pair_adapter_title), !btPairUsbMode) {
+            if (btPairUsbMode) {
+                stopUsbDiscoverySession()
+                btPairUsbMode = false
+                render()
+            }
+        }, LinearLayout.LayoutParams(0, dp(52), 1f))
+        segment.addView(space(10), LinearLayout.LayoutParams(dp(10), 1))
+        segment.addView(button(getString(R.string.bt_pair_source_external), btPairUsbMode) {
+            if (!btPairUsbMode) {
+                stopBtPairSession()
+                btPairUsbMode = true
+                render()
+            }
+        }, LinearLayout.LayoutParams(0, dp(52), 1f))
+        content.addView(segment, LinearLayout.LayoutParams(-1, -2).apply {
+            bottomMargin = dp(SETTINGS_BLOCK_GAP_DP)
+        })
+        if (btPairUsbMode) {
+            btPairUsbPage(content)
+            return
+        }
         val adapter = btAdapterOrNull()
         if (adapter == null) {
             content.addView(label(getString(R.string.bt_pair_unavailable), 15, MUTED))
@@ -1320,6 +1364,8 @@ class DiPlayActivity : ComponentActivity() {
     }
 
     private fun stopBtPairSession() {
+        // src15: 离开配对页时外置蓝牙的 inquiry 必须一并停掉（与内置同一纪律）。
+        stopUsbDiscoverySession()
         try {
             val adapter = btAdapterOrNull()
             if (adapter != null && adapter.isDiscovering) adapter.cancelDiscovery()
@@ -1331,6 +1377,9 @@ class DiPlayActivity : ComponentActivity() {
         btPairReceiver = null
         btPairNearby.clear()
         btPairBonding.clear()
+        btPairUsbNearby.clear()
+        btPairUsbBonding.clear()
+        btPairUsbFailed.clear()
     }
 
     @SuppressLint("MissingPermission")
@@ -1467,6 +1516,249 @@ class DiPlayActivity : ComponentActivity() {
             }, LinearLayout.LayoutParams(-2, dp(48)))
         }
         return rowLayout
+    }
+
+    // ---- src15: btpair 外置蓝牙模式（USB 棒「车找手机」：HCI Inquiry 搜索 + 车机侧发起配对） ----
+    //
+    // 硬门控：inquiry 只在本页外置模式、页面在前台时运行；离开页面
+    // （stopBtPairSession 覆盖切页/onPause/onDestroy）必停。CarPlay 会话
+    // 活跃/连接中、或蓝牙来源被强制为内置时，搜索不可用且页面给出提示；
+    // 搜索与配对都不碰已建立的 CarPlay 连接路径。
+
+    private fun btPairUsbPage(content: LinearLayout) {
+        val dongle = CarPlayBluetoothManager.get(this).usbDongle
+        val present = dongle?.isSupported() == true
+
+        val statusCard = card()
+        val statusTexts = column()
+        statusTexts.addView(label(getString(R.string.bt_pair_source_external), 18, TEXT, true))
+        btPairUsbStatusText = label("", 14, MUTED).apply { setPadding(0, dp(3), 0, 0) }
+        statusTexts.addView(btPairUsbStatusText)
+        statusCard.addView(statusTexts)
+        btPairUsbSearchButton = button(getString(R.string.bt_pair_usb_search), false) { startUsbDiscovery() }
+        statusCard.addView(btPairUsbSearchButton, matchButton(12, 52))
+        content.addView(statusCard, LinearLayout.LayoutParams(-1, -2).apply {
+            bottomMargin = dp(SETTINGS_BLOCK_GAP_DP)
+        })
+
+        content.addView(label(getString(R.string.bt_pair_paired_heading), 15, MUTED, true).apply {
+            if (realSdkInt() >= Build.VERSION_CODES.LOLLIPOP) letterSpacing = .12f
+            setPadding(0, 0, 0, dp(10))
+        })
+        val pairedCard = card().apply { setPadding(dp(16), dp(6), dp(16), dp(6)) }
+        btPairUsbPairedList = pairedCard
+        content.addView(pairedCard, LinearLayout.LayoutParams(-1, -2).apply {
+            bottomMargin = dp(SETTINGS_BLOCK_GAP_DP)
+        })
+
+        val nearbyHead = row().apply { gravity = Gravity.CENTER_VERTICAL; setPadding(0, 0, 0, dp(10)) }
+        nearbyHead.addView(label(getString(R.string.bt_pair_nearby_heading), 15, MUTED, true).apply {
+            if (realSdkInt() >= Build.VERSION_CODES.LOLLIPOP) letterSpacing = .12f
+        })
+        btPairUsbScanStateText = label("", 13, MUTED).apply { setPadding(dp(10), 0, 0, 0) }
+        nearbyHead.addView(btPairUsbScanStateText)
+        content.addView(nearbyHead)
+        val nearbyCard = card().apply { setPadding(dp(16), dp(6), dp(16), dp(6)) }
+        btPairUsbNearbyList = nearbyCard
+        content.addView(nearbyCard, LinearLayout.LayoutParams(-1, -2))
+
+        // 棒在场但 HCI 还没起来时（开机自动恢复是异步的），在本页显式补一次
+        // 启用，成功后回主线程刷新状态。强制内置（来源覆盖）或 CarPlay
+        // 会话中不启用，门控与开机恢复逻辑保持一致。
+        if (present && dongle?.isEnabled() != true &&
+            BluetoothSourceOverride.usbAllowed(this) && !CarPlayBackgroundSession.hasSession()
+        ) {
+            Thread({
+                val ok = runCatching {
+                    CarPlayBluetoothManager.get(this).usbDongle?.enable() == true
+                }.getOrDefault(false)
+                if (ok) runOnUiThread {
+                    if (page == "btpair" && btPairUsbMode) refreshUsbPairStatus()
+                }
+            }, "BtPairUsbEnable").apply { isDaemon = true }.start()
+        }
+
+        refreshUsbPairStatus()
+        refreshUsbPairLists()
+    }
+
+    private fun refreshUsbPairStatus() {
+        val statusLabel = btPairUsbStatusText ?: return
+        val dongle = CarPlayBluetoothManager.get(this).usbDongle
+        val present = dongle?.isSupported() == true
+        val forcedBuiltin =
+            BluetoothSourceOverride.load(this) == BluetoothSourceOverride.FORCE_BUILTIN
+        val sessionBusy = CarPlayBackgroundSession.hasSession()
+        val enabled = dongle?.isEnabled() == true
+        when {
+            !present -> {
+                statusLabel.text = getString(R.string.bt_pair_usb_absent)
+                statusLabel.setTextColor(MUTED)
+            }
+            forcedBuiltin -> {
+                statusLabel.text = getString(R.string.bt_pair_usb_forced_builtin)
+                statusLabel.setTextColor(WARNING)
+            }
+            sessionBusy -> {
+                statusLabel.text = getString(R.string.bt_pair_usb_session_busy)
+                statusLabel.setTextColor(WARNING)
+            }
+            !enabled -> {
+                statusLabel.text = getString(R.string.bt_pair_usb_not_enabled)
+                statusLabel.setTextColor(MUTED)
+            }
+            else -> {
+                statusLabel.text = getString(R.string.bt_pair_usb_ready)
+                statusLabel.setTextColor(READY)
+            }
+        }
+        btPairUsbSearchButton?.isEnabled =
+            present && !forcedBuiltin && !sessionBusy && enabled && !btPairUsbScanning
+        btPairUsbScanStateText?.text = getString(
+            if (btPairUsbScanning) R.string.bt_pair_scanning else R.string.bt_pair_scan_done)
+    }
+
+    private fun startUsbDiscovery() {
+        if (btPairUsbScanning) return
+        // CarPlay 会话活跃/连接中禁止启动搜索，只刷新状态展示提示。
+        if (CarPlayBackgroundSession.hasSession()) {
+            refreshUsbPairStatus()
+            return
+        }
+        val discovery: CarPlayBluetoothDiscovery = CarPlayBluetoothManager.get(this)
+        btPairUsbNearby.clear()
+        btPairUsbFailed.clear()
+        refreshUsbPairLists()
+        btPairUsbScanning = discovery.startDiscovery(
+            onDevice = { device ->
+                runOnUiThread {
+                    if (page != "btpair" || !btPairUsbMode) return@runOnUiThread
+                    btPairUsbNearby[device.address] = device
+                    refreshUsbPairLists()
+                }
+            },
+            onFinished = { _ ->
+                btPairUsbScanning = false
+                runOnUiThread {
+                    if (page == "btpair" && btPairUsbMode) {
+                        refreshUsbPairStatus()
+                        refreshUsbPairLists()
+                    }
+                }
+            },
+        )
+        refreshUsbPairStatus()
+    }
+
+    private fun stopUsbDiscoverySession() {
+        if (!btPairUsbScanning) return
+        runCatching { CarPlayBluetoothManager.get(this).stopDiscovery() }
+        btPairUsbScanning = false
+    }
+
+    private fun refreshUsbPairLists() {
+        val pairedList = btPairUsbPairedList ?: return
+        val nearbyList = btPairUsbNearbyList ?: return
+        pairedList.removeAllViews()
+        nearbyList.removeAllViews()
+        val discovery: CarPlayBluetoothDiscovery = CarPlayBluetoothManager.get(this)
+        val paired = runCatching { discovery.pairedDevices() }.getOrDefault(emptyList())
+        if (paired.isEmpty()) {
+            pairedList.addView(label(getString(R.string.bt_pair_paired_empty), 14, MUTED).apply {
+                setPadding(0, dp(10), 0, dp(10))
+            })
+        } else {
+            paired.forEachIndexed { index, device ->
+                if (index > 0) pairedList.addView(btPairDivider())
+                val rowLayout = row().apply {
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(0, dp(10), 0, dp(10))
+                }
+                rowLayout.addView(label(device.name, 16, TEXT), LinearLayout.LayoutParams(0, -2, 1f))
+                rowLayout.addView(label(getString(R.string.bt_pair_paired_state), 13, READY))
+                pairedList.addView(rowLayout)
+            }
+        }
+        // 搜索结果里排除已配对设备（配对成功后它们移入上方列表）。
+        val nearby = btPairUsbNearby.values.filter { device ->
+            !paired.any { it.address.equals(device.address, ignoreCase = true) }
+        }
+        if (nearby.isEmpty()) {
+            nearbyList.addView(label(getString(R.string.bt_pair_nearby_empty), 14, MUTED).apply {
+                setPadding(0, dp(10), 0, dp(10))
+            })
+        } else {
+            nearby.forEachIndexed { index, device ->
+                if (index > 0) nearbyList.addView(btPairDivider())
+                nearbyList.addView(btPairUsbNearbyRow(device))
+            }
+        }
+    }
+
+    private fun btPairUsbNearbyRow(device: UsbDiscoveredDevice): View {
+        val rowLayout = row().apply {
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(6), 0, dp(6))
+        }
+        val texts = column()
+        texts.addView(label(device.name?.takeIf { it.isNotBlank() } ?: device.address, 16, TEXT))
+        // CoD 主类 0x02 = 手机，加一行标注；其余设备照常列出、不滤掉。
+        if ((device.classOfDevice shr 8) and 0x1F == 0x02) {
+            texts.addView(label(getString(R.string.bt_pair_usb_phone_tag), 12, ACCENT).apply {
+                setPadding(0, dp(2), 0, 0)
+            })
+        }
+        rowLayout.addView(texts, LinearLayout.LayoutParams(0, -2, 1f))
+        when {
+            btPairUsbBonding.contains(device.address) ->
+                rowLayout.addView(label(getString(R.string.bt_pair_pairing), 13, ACCENT))
+            btPairUsbFailed.contains(device.address) -> {
+                rowLayout.addView(label(getString(R.string.bt_pair_pair_failed), 13, WARNING).apply {
+                    setPadding(0, 0, dp(10), 0)
+                })
+                rowLayout.addView(button(getString(R.string.bt_pair_pair_action), false) {
+                    pairUsbDevice(device)
+                }, LinearLayout.LayoutParams(-2, dp(48)))
+            }
+            else -> rowLayout.addView(button(getString(R.string.bt_pair_pair_action), false) {
+                pairUsbDevice(device)
+            }, LinearLayout.LayoutParams(-2, dp(48)))
+        }
+        return rowLayout
+    }
+
+    private fun pairUsbDevice(device: UsbDiscoveredDevice) {
+        if (CarPlayBackgroundSession.hasSession()) {
+            refreshUsbPairStatus()
+            return
+        }
+        // 控制器在 inquiry 期间无法可靠 paging，先停搜索再配对（与内置页同策略）。
+        stopUsbDiscoverySession()
+        btPairUsbFailed.remove(device.address)
+        btPairUsbBonding.add(device.address)
+        refreshUsbPairLists()
+        refreshUsbPairStatus()
+        Thread({
+            val result = runCatching {
+                CarPlayBluetoothManager.get(this).pairDevice(device.address)
+            }.getOrElse { error ->
+                BluetoothPairResult.Failed(error.message ?: error.javaClass.simpleName)
+            }
+            runOnUiThread {
+                btPairUsbBonding.remove(device.address)
+                when (result) {
+                    is BluetoothPairResult.Success -> {
+                        btPairUsbNearby.remove(device.address)
+                        btPairUsbFailed.remove(device.address)
+                    }
+                    is BluetoothPairResult.Failed -> btPairUsbFailed.add(device.address)
+                }
+                if (page == "btpair" && btPairUsbMode) {
+                    refreshUsbPairLists()
+                    refreshUsbPairStatus()
+                }
+            }
+        }, "BtPairUsbBond").apply { isDaemon = true }.start()
     }
 
     // Only the category scrolls, so the rail keeps showing where the driver is.

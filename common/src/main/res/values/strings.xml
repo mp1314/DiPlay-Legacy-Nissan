@@ -913,6 +913,15 @@
     <string name="bt_pair_pairing">Pairing…</string>
     <string name="bt_pair_permission_note">Bluetooth permission is not granted, so devices cannot be searched or paired. Allow Nearby devices for DiPlay in the system app settings.</string>
     <string name="bt_pair_unavailable">This head unit has no Bluetooth adapter.</string>
+    <string name="bt_pair_source_external">External Bluetooth (USB)</string>
+    <string name="bt_pair_usb_absent">No USB Bluetooth dongle is plugged in.</string>
+    <string name="bt_pair_usb_forced_builtin">The Bluetooth source is set to built-in only, so external Bluetooth search is unavailable. Switch the source with the Bluetooth item on the home screen first.</string>
+    <string name="bt_pair_usb_session_busy">A CarPlay session is active or connecting. End it before searching, so the search cannot disturb the connection.</string>
+    <string name="bt_pair_usb_ready">Ready to search</string>
+    <string name="bt_pair_usb_not_enabled">The USB Bluetooth dongle is not enabled yet.</string>
+    <string name="bt_pair_usb_search">Search for phones</string>
+    <string name="bt_pair_usb_phone_tag">Phone</string>
+    <string name="bt_pair_pair_failed">Pairing failed</string>
     <string name="settings_media_focus_exclusive">Exclusive media audio focus</string>
     <string name="settings_media_focus_exclusive_description">Request permanent focus for media instead of letting other players duck CarPlay. Only helps head units that duck CarPlay to silence; it can mute other players. Takes effect on the next connection.</string>
 </resources>

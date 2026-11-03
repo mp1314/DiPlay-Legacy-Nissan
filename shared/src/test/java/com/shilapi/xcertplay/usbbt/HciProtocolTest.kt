@@ -181,4 +181,116 @@ class HciProtocolTest {
         assertEquals(5, HciProtocol.rfcommDlci(2, initiator = false))
         assertEquals(HciProtocol.RFCOMM_DLCI_CONTROL, 0)
     }
+
+    // ------------------------------------------------------------------
+    // Inquiry (src15): "car finds phone" discovery.
+    // ------------------------------------------------------------------
+
+    @Test
+    fun encodeInquiryCommand() {
+        // HCI_Inquiry = OGF 0x01, OCF 0x0001 -> opcode 0x0401.
+        // Params: LAP GIAC LSB-first (33 8B 9E) | length | num_responses.
+        assertEquals(0x0401, HciProtocol.OP_INQUIRY)
+        assertEquals(0x0402, HciProtocol.OP_INQUIRY_CANCEL)
+        assertArrayEquals(
+            byteArrayOf(0x01, 0x04, 0x05, 0x33, 0x8B.toByte(), 0x9E.toByte(), 0x08, 0x00),
+            HciProtocol.encodeCommand(
+                HciProtocol.OP_INQUIRY,
+                HciProtocol.encodeInquiry(inquiryLength = 0x08),
+            ),
+        )
+    }
+
+    @Test
+    fun parseInquiryResultEvent() {
+        // 0x02 | num=1 | BD_ADDR LSB-first | PSRM | reserved x2 | CoD 0x5A020C (phone) | clock
+        val params = byteArrayOf(
+            0x01,
+            0xF6.toByte(), 0xE5.toByte(), 0xD4.toByte(), 0xC3.toByte(), 0xB2.toByte(), 0xA1.toByte(),
+            0x01, 0x00, 0x00,
+            0x0C, 0x02, 0x5A,
+            0x34, 0x12,
+        )
+        val devices = HciProtocol.parseInquiryResult(HciProtocol.HciEvent(0x02, params))
+        assertEquals(1, devices.size)
+        assertEquals("A1:B2:C3:D4:E5:F6", devices[0].address)
+        assertEquals(0x5A020C, devices[0].classOfDevice)
+        assertNull(devices[0].name)
+        assertNull(devices[0].rssi)
+    }
+
+    @Test
+    fun parseInquiryResultWithRssiEvent() {
+        // Same layout as the standard result, RSSI bytes appended: 0xC4 = -60 dBm.
+        val params = byteArrayOf(
+            0x01,
+            0xF6.toByte(), 0xE5.toByte(), 0xD4.toByte(), 0xC3.toByte(), 0xB2.toByte(), 0xA1.toByte(),
+            0x01, 0x00, 0x00,
+            0x0C, 0x02, 0x5A,
+            0x34, 0x12,
+            0xC4.toByte(),
+        )
+        val devices = HciProtocol.parseInquiryResultWithRssi(HciProtocol.HciEvent(0x22, params))
+        assertEquals(1, devices.size)
+        assertEquals("A1:B2:C3:D4:E5:F6", devices[0].address)
+        assertEquals(-60, devices[0].rssi)
+    }
+
+    @Test
+    fun parseExtendedInquiryResultEvent() {
+        // 0x2F | num=1 | BD_ADDR | PSRM | reserved | CoD | clock | RSSI | EIR(240)
+        val eir = ByteArray(240)
+        val name = "Pixel 9".toByteArray(Charsets.UTF_8)
+        eir[0] = (name.size + 1).toByte() // structure length includes the type byte
+        eir[1] = 0x09 // Complete Local Name
+        name.copyInto(eir, 2)
+        val params = ByteArray(1 + 254)
+        params[0] = 0x01
+        byteArrayOf(
+            0xF6.toByte(), 0xE5.toByte(), 0xD4.toByte(), 0xC3.toByte(), 0xB2.toByte(), 0xA1.toByte(),
+        ).copyInto(params, 1)
+        params[7] = 0x01 // page scan repetition mode
+        params[8] = 0x00 // reserved
+        params[9] = 0x0C; params[10] = 0x02; params[11] = 0x5A // CoD
+        params[14] = 0xBE.toByte() // RSSI = -66
+        eir.copyInto(params, 15)
+        val devices = HciProtocol.parseExtendedInquiryResult(HciProtocol.HciEvent(0x2F, params))
+        assertEquals(1, devices.size)
+        assertEquals("A1:B2:C3:D4:E5:F6", devices[0].address)
+        assertEquals("Pixel 9", devices[0].name)
+        assertEquals(-66, devices[0].rssi)
+        assertEquals(0x5A020C, devices[0].classOfDevice)
+    }
+
+    @Test
+    fun parseEirLocalNamePreference() {
+        // Shortened name (0x08) is used only when no complete name (0x09) exists.
+        val shortenedOnly = byteArrayOf(0x06, 0x08) + "Pixel".toByteArray(Charsets.UTF_8)
+        assertEquals("Pixel", HciProtocol.parseEirLocalName(shortenedOnly))
+        val both = byteArrayOf(0x06, 0x08) + "Pixel".toByteArray(Charsets.UTF_8) +
+            byteArrayOf(0x08, 0x09) + "Pixel 9".toByteArray(Charsets.UTF_8)
+        assertEquals("Pixel 9", HciProtocol.parseEirLocalName(both))
+        assertNull(HciProtocol.parseEirLocalName(byteArrayOf(0x02, 0x01, 0x06)))
+        assertNull(HciProtocol.parseEirLocalName(ByteArray(0)))
+    }
+
+    @Test
+    fun parseInquiryCompleteAndTruncatedResults() {
+        assertEquals(
+            0,
+            HciProtocol.parseInquiryComplete(HciProtocol.HciEvent(0x01, byteArrayOf(0x00))),
+        )
+        assertNull(HciProtocol.parseInquiryComplete(HciProtocol.HciEvent(0x01, ByteArray(0))))
+        assertNull(HciProtocol.parseInquiryComplete(HciProtocol.HciEvent(0x02, byteArrayOf(0x00))))
+        // Declared two responses but only one full record: keep the complete one.
+        val params = ByteArray(1 + 14)
+        params[0] = 0x02
+        byteArrayOf(
+            0xF6.toByte(), 0xE5.toByte(), 0xD4.toByte(), 0xC3.toByte(), 0xB2.toByte(), 0xA1.toByte(),
+        ).copyInto(params, 1)
+        assertEquals(1, HciProtocol.parseInquiryResult(HciProtocol.HciEvent(0x02, params)).size)
+        // Wrong event codes parse to nothing.
+        assertEquals(0, HciProtocol.parseInquiryResult(HciProtocol.HciEvent(0x22, params)).size)
+        assertEquals(0, HciProtocol.parseExtendedInquiryResult(HciProtocol.HciEvent(0x02, params)).size)
+    }
 }

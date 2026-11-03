@@ -876,6 +876,15 @@
     <string name="bt_pair_pairing">配对中…</string>
     <string name="bt_pair_permission_note">未授予蓝牙权限，无法搜索和配对设备。请在系统应用设置中为本软件允许「附近的设备」。</string>
     <string name="bt_pair_unavailable">这台车机没有蓝牙适配器。</string>
+    <string name="bt_pair_source_external">外置蓝牙（USB）</string>
+    <string name="bt_pair_usb_absent">未插入 USB 蓝牙棒。</string>
+    <string name="bt_pair_usb_forced_builtin">蓝牙来源已设为仅内置，外置蓝牙搜索不可用。请先在主页功能栏的蓝牙项切换来源。</string>
+    <string name="bt_pair_usb_session_busy">CarPlay 会话正在运行或连接中，结束会话后才能搜索，以免干扰连接。</string>
+    <string name="bt_pair_usb_ready">已就绪，可以搜索</string>
+    <string name="bt_pair_usb_not_enabled">USB 蓝牙棒尚未启用。</string>
+    <string name="bt_pair_usb_search">搜索手机</string>
+    <string name="bt_pair_usb_phone_tag">手机</string>
+    <string name="bt_pair_pair_failed">配对失败</string>
     <string name="settings_media_focus_exclusive">媒体音频焦点独占</string>
     <string name="settings_media_focus_exclusive_description">媒体改请求永久焦点，不再让其他播放器压低 CarPlay。只对会把 CarPlay 压到无声的车机有效；可能导致其他播放器无声。下次连接生效。</string>
 </resources>
