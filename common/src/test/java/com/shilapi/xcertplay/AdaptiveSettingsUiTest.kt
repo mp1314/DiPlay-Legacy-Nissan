@@ -69,6 +69,8 @@ class AdaptiveSettingsUiTest {
         assertFalse(texts(screen).any { it.text == screen.getString(R.string.ready) })
     }
 
+    // src12: 取上游用例。nissan src4 的「缺凭据自动生成 FreeAuto- 凭据」逻辑已按
+    // 用户裁决（逻辑以官方为准）舍弃，缺凭据时官方行为是提示打开连接设置页。
     @Test fun chosenPhoneWithMissingManualHotspotOffersConnectionSetup() {
         AirPlayPersistence.saveWirelessEnabled(context, true)
         AirPlayPersistence.saveWirelessHotspotMode(context, WirelessHotspotMode.MANUAL)
@@ -331,12 +333,16 @@ class AdaptiveSettingsUiTest {
 
     @Test fun advancedContainsOnlyExpertSections() {
         val screen = openSettings()
-        descendants(screen.window.decorView)
+        // The advanced destination lives in the rail in the expanded layout
+        // and in the overview utilities card in the compact layout; both carry
+        // the same content description, so scope to the rail when it is present.
+        val railScroll: ScrollView? = ReflectionHelpers.getField(screen, "settingsRailScroll")
+        descendants(railScroll ?: screen.window.decorView)
             .single { candidate ->
                 candidate.contentDescription == screen.getString(
                     R.string.settings_open_category,
                     screen.getString(R.string.settings_advanced),
-                ) && descendants(candidate).filterIsInstance<ImageView>().count() == 2
+                )
             }
             .performClick()
 
@@ -444,10 +450,12 @@ class AdaptiveSettingsUiTest {
     fun expandedRailStaysOutsideTheScrollingCategory() {
         val screen = openSettings()
         val categoryScroll = ReflectionHelpers.getField<ScrollView>(screen, "rootScroll")
-        val railDestination = descendants(screen.window.decorView).first {
+        // The rail destination is scoped to the rail scroll: the overview page
+        // also links to the category, and the approved rail destination has no icon.
+        val railScroll: ScrollView = ReflectionHelpers.getField(screen, "settingsRailScroll")
+        val railDestination = descendants(railScroll).single {
             it.contentDescription == screen.getString(R.string.settings_open_category,
-                screen.getString(R.string.settings_display)) &&
-                descendants(it).filterIsInstance<ImageView>().count() == 1
+                screen.getString(R.string.settings_display))
         }
 
         assertTrue(texts(screen).any { it.text == screen.getString(R.string.settings_quick_settings) && isInside(it, categoryScroll) })
@@ -459,14 +467,24 @@ class AdaptiveSettingsUiTest {
     fun expandedRailUsesAnIconForEveryDestination() {
         val screen = openSettings()
 
-        val destinations = descendants(screen.window.decorView).filter { destination ->
-            destination.contentDescription?.startsWith("Open ") == true &&
-                destination.contentDescription?.endsWith(" settings") == true &&
-                descendants(destination).filterIsInstance<ImageView>().count() == 1
-        }.toList()
-        assertEquals(8, destinations.size)
+        val railScroll: ScrollView = ReflectionHelpers.getField(screen, "settingsRailScroll")
+        val rail = railScroll.getChildAt(0) as ViewGroup
+        val destinations = (0 until rail.childCount).map(rail::getChildAt).toList()
+        // One destination per settings category. The approved rail carries no
+        // icons: each destination's visual marker is the selection indicator
+        // bar next to its title label, so assert that structure instead.
+        assertEquals(SettingsCategory.entries.size, destinations.size)
+        val expectedDescriptions = SettingsCategory.entries.map { category ->
+            screen.getString(R.string.settings_open_category,
+                ReflectionHelpers.callInstanceMethod<String>(screen, "settingsCategoryTitle",
+                    ReflectionHelpers.ClassParameter(SettingsCategory::class.java, category)))
+        }.toSet()
         destinations.forEach { destination ->
-            assertEquals(1, descendants(destination).filterIsInstance<ImageView>().count())
+            assertTrue(destination.contentDescription?.toString() in expectedDescriptions)
+            val views = descendants(destination).toList()
+            assertEquals(1, views.filterIsInstance<TextView>().count())
+            assertEquals(1, views.count { it !is ViewGroup && it !is TextView })
+            assertTrue(views.none { it is ImageView })
         }
     }
 
@@ -521,7 +539,8 @@ class AdaptiveSettingsUiTest {
             candidate.contentDescription == screen.getString(
                 R.string.settings_open_category,
                 screen.getString(category),
-            ) && descendants(candidate).filterIsInstance<ImageView>().count() == 2
+                // One chevron per utility row in the approved layout.
+            ) && descendants(candidate).filterIsInstance<ImageView>().count() == 1
         }
 
         val diagnostics = utilityRow(R.string.diagnostics)

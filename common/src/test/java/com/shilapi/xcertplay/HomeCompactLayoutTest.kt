@@ -2,7 +2,7 @@ package com.shilapi.xcertplay
 
 import android.view.View
 import android.view.ViewGroup
-import android.widget.TextView
+import android.widget.ImageView
 import com.shilapi.xcertplay.host.R
 import org.junit.Assert.*
 import org.junit.Test
@@ -35,8 +35,11 @@ class HomeCompactLayoutTest {
         val activity = Robolectric.buildActivity(DiPlayActivity::class.java).setup().get()
         shadowOf(activity).setInMultiWindowMode(multiWindow)
         ReflectionHelpers.callInstanceMethod<Unit>(activity, "render")
-        val hero = activity.getString(R.string.a_familiar_drive)
-        return descendants(activity.window.decorView).filterIsInstance<TextView>().none { it.text == hero }
+        // The full Nissan home brands the screen with the logo; the compact
+        // home drops it. (The old hero line no longer exists in the UI.)
+        val logoDescription = activity.getString(R.string.carplay_icon)
+        return descendants(activity.window.decorView).filterIsInstance<ImageView>()
+            .none { it.contentDescription == logoDescription }
     }
 
     private fun descendants(view: View): Sequence<View> = sequence {

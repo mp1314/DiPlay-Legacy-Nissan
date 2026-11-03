@@ -43,4 +43,9 @@ dependencies {
     testImplementation("org.robolectric:robolectric:4.17")
     testImplementation("org.mockito:mockito-core:5.20.0")
     testImplementation(libs.jmdns)
+    // Wi-Fi join QR code on the wireless-failure dialog (pure-Java ZXing encoder).
+    // Local jar: Gradle's JVM cannot TLS through the proxy, so the Maven artifact is
+    // vendored instead of resolved (com.google.zxing:core:3.5.3, SHA-256
+    // 8d8064c1636fdaef7189dd9055c7d59950a8940a12f2293956446ec3c109fd82).
+    implementation(files("libs/zxing-core-3.5.3.jar"))
 }

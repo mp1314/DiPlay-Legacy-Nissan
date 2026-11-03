@@ -12,18 +12,27 @@ import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import com.shilapi.xcertplay.compat.BluetoothCompat
 import android.bluetooth.BluetoothProfile
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.content.res.ColorStateList
 import android.content.res.Configuration
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioTrack
 import android.net.Uri
 import android.os.Build
@@ -50,6 +59,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.shilapi.xcertplay.adb.LocalAdb
 import com.shilapi.xcertplay.bluetooth.BluetoothAddressResolver
+import com.shilapi.xcertplay.bluetooth.BluetoothSourceOverride
 import com.shilapi.xcertplay.bluetooth.CarPlayBluetoothManager
 import com.shilapi.xcertplay.usbbt.UsbBtDongleDetector
 import com.shilapi.xcertplay.airplay.CarPlayClusterDisplay
@@ -135,9 +145,9 @@ internal object SettingsInformationArchitecture {
 /** DiAuto's visual language, with a connection flow for an independent CarPlay receiver. */
 class DiPlayActivity : ComponentActivity() {
     private val handler = Handler(Looper.getMainLooper())
-    private val automaticUpdateCheck = Runnable {
-        if (!isFinishing && !isDestroyed) updater.checkAutomatically()
-    }
+    // src12（用户裁决）：去掉更新提醒——不做启动/主页自动检查、不弹更新窗，
+    // 自动检查入口与设置页的检查入口一并移除（本包为 freeauto 证书签名，
+    // 官方更新包也无法覆盖安装）。DiPlayUpdater 类保留但永不触发检查。
     private val updaterDelegate = lazy { DiPlayUpdater(this) }
     private val updater by updaterDelegate
     private fun lazyUpdaterInitialized() = updaterDelegate.isInitialized()
@@ -156,6 +166,29 @@ class DiPlayActivity : ComponentActivity() {
     private var status: TextView? = null
     private var connectButton: Button? = null
     private var disconnectButton: Button? = null
+    // fix5: 顶栏状态点/短状态/时钟（home 页），由 refreshStatus() 同步。
+    private var headerStatusDot: View? = null
+    private var headerStatusText: TextView? = null
+    private var headerClock: TextView? = null
+    // src13: 主页蓝牙歌词区（有歌词才显示，无则 GONE 不占位）。
+    private var lyricBlock: LinearLayout? = null
+    private var lyricCurrentLabel: TextView? = null
+    private var lyricNextLabel: TextView? = null
+    private var lyricsSession: HomeLyricsSession? = null
+    // src13: 主页 GPS 码速（数字标签 + 定位监听，随页面/生命周期启停）。
+    private var speedValueLabel: TextView? = null
+    private var speedLocationManager: LocationManager? = null
+    private var speedListener: LocationListener? = null
+    private var activityResumed = false
+    // src13: 软件内蓝牙配对页（page="btpair"）的会话状态。
+    private var btPairReceiver: BroadcastReceiver? = null
+    private var btPairNearby = LinkedHashMap<String, BluetoothDevice>()
+    private var btPairBonding = mutableSetOf<String>()
+    private var btPairScanning = false
+    private var btPairStatusText: TextView? = null
+    private var btPairScanStateText: TextView? = null
+    private var btPairPairedList: LinearLayout? = null
+    private var btPairNearbyList: LinearLayout? = null
     private var lastRunning: Boolean? = null
     private var pendingWireless = false
     private var initialLaunch = true
@@ -235,7 +268,7 @@ class DiPlayActivity : ComponentActivity() {
         connect(notificationTransport)
     }
     private val tick = object : Runnable {
-        override fun run() { refreshStatus(); handler.postDelayed(this, 1000) }
+        override fun run() { refreshStatus(); refreshLyrics(); handler.postDelayed(this, 1000) }
     }
     private val bluetoothPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) choosePhone() else permissionHelp(getString(R.string.nearby_devices), getString(R.string.allow_nearby_devices_so_diplay_can_connect_to_your_paired))
@@ -288,7 +321,11 @@ class DiPlayActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // USB 蓝牙配对：把 Numeric Comparison 配对请求路由到前台 Activity 的对话框
+        //（与 CarPlayHostActivity 同接法；router 单弱引用、installOn 幂等，无双份冲突）。
+        runCatching { UsbBtPairingUiRouter.installOn(CarPlayBluetoothManager.get(this)) }
         if (savedInstanceState == null) {
+            // 上游 v0.2.74：探测日志改后台线程，避免 onCreate 主线程阻塞。
             Thread({ LegacyConnectionProbe.log(applicationContext) }, "DiPlayProbeLog").apply { isDaemon = true }.start()
         }
         // Back on the home page finishes this activity while the session runs on, so the icon lands here.
@@ -328,7 +365,6 @@ class DiPlayActivity : ComponentActivity() {
             ?.let { runCatching { SettingsCategory.valueOf(it) }.getOrNull() }
         page = savedInstanceState?.getString("page") ?: intent.getStringExtra("page") ?: "home"
         render()
-        handler.postDelayed(automaticUpdateCheck, 4000L)
         scheduleAutomaticVehicleValidation()
         handleWirelessRecovery()
         // USB-Bluetooth dongle: route Numeric Comparison pairing requests to
@@ -425,6 +461,7 @@ class DiPlayActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        activityResumed = true
         UsbBtPairingUiRouter.register(this)
         DiPlayBootstrap.restoreUsbBluetooth(this)
         // Returning from another activity can bring the head unit's own density back.
@@ -435,9 +472,12 @@ class DiPlayActivity : ComponentActivity() {
         }
         handler.removeCallbacks(tick); handler.post(tick)
         updater.onResume()
+        UsbBtPairingUiRouter.register(this)
         // Back from the car settings: refresh the car hotspot reminder on the home page.
         if (!initialLaunch && !adbSwitchChangePending && !pausedForAdbSwitchChange &&
-            (page == "home" || page == "settings" || page == "connection")) render()
+            (page == "home" || page == "settings" || page == "connection" || page == "btpair")) render()
+        syncSpeedListener()
+        syncLyricsSubscription()
         pausedForAdbSwitchChange = false
         if (!initialLaunch && CarPlayBackgroundSession.hasSession() && page == "home" && !userNavigatedFromCarPlay) {
             openProjection()
@@ -453,16 +493,23 @@ class DiPlayActivity : ComponentActivity() {
         }
     }
     override fun onPause() {
+        activityResumed = false
+        stopSpeedUpdates()
+        stopLyricsUpdates()
+        stopBtPairSession()
         UsbBtPairingUiRouter.unregister(this)
         userNavigatedFromCarPlay = false
         cancelKeyLearning()
+        UsbBtPairingUiRouter.unregister(this)
         pausedForAdbSwitchChange = adbSwitchChangePending
         handler.removeCallbacks(tick)
         super.onPause()
     }
 
     override fun onDestroy() {
-        handler.removeCallbacks(automaticUpdateCheck)
+        stopSpeedUpdates()
+        stopLyricsUpdates()
+        stopBtPairSession()
         if (lazyUpdaterInitialized()) updater.close()
         hotspotJoinControls?.close()
         cancelUsbPermissionSetup()
@@ -518,7 +565,13 @@ class DiPlayActivity : ComponentActivity() {
         val restoreRailFocus = keepRailPosition &&
             (pendingRailFocus || settingsRailScroll?.hasFocus() == true)
         settingsRailScroll = null
+        // src13: 离开蓝牙配对页必须停掉 discovery 并注销接收器（discovery 会干扰 CarPlay 连接）。
+        if (renderedPage == "btpair" && page != "btpair") stopBtPairSession()
         status = null; connectButton = null; disconnectButton = null; lastRunning = null; carButtonCard = null
+        headerStatusDot = null; headerStatusText = null; headerClock = null
+        speedValueLabel = null
+        lyricBlock = null; lyricCurrentLabel = null; lyricNextLabel = null
+        btPairStatusText = null; btPairScanStateText = null; btPairPairedList = null; btPairNearbyList = null
         reconnectBar = null
         readinessCard = null
         exportButton = null
@@ -538,23 +591,48 @@ class DiPlayActivity : ComponentActivity() {
         } else {
             if (compact) content.setPadding(dp(12), dp(10), dp(12), dp(12))
             else content.setPadding(dp(32), dp(24), dp(32), dp(32))
-            content.addView(header)
-            content.addView(space(if (compact) 8 else 24))
-            if (page == "settings") content.addView(reconnectBar(), LinearLayout.LayoutParams(-1, -2).apply {
-                bottomMargin = dp(SETTINGS_BLOCK_GAP_DP)
-            })
-            when (page) {
-                "connection" -> connectionSetup(content)
-                "settings" -> settingsCategoryContent(content)
-                "about" -> about(content)
-                else -> home(content)
+            if (page == "home") {
+                // fix5: 功能栏贴底整宽——header 与功能栏放在滚动区之外，内容不足一屏时功能栏仍贴底。
+                // src4-追加3: 主内容区在顶栏与功能栏之间的可用高度内垂直居中
+                // (ScrollView 已是 fillViewport；content 高 MATCH_PARENT + CENTER_VERTICAL；
+                // 内容超高时仍按内容全高测量、可正常滚动)。只动 home，其他页面不受影响。
+                content.layoutParams = android.widget.FrameLayout.LayoutParams(-1, -1)
+                content.gravity = Gravity.CENTER_VERTICAL
+                if (compact) content.setPadding(dp(12), dp(6), dp(12), dp(8))
+                else content.setPadding(dp(32), dp(16), dp(32), dp(20))
+                home(content)
+                column().apply {
+                    setBackgroundColor(BG)
+                    addView(header)
+                    addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+                    addView(homeFunctionBar(when {
+                        compact -> 14
+                        resources.configuration.screenWidthDp >= 850 -> 16
+                        else -> 15
+                    }))
+                }
+            } else {
+                content.addView(header)
+                content.addView(space(if (compact) 8 else 24))
+                if (page == "settings") content.addView(reconnectBar(), LinearLayout.LayoutParams(-1, -2).apply {
+                    bottomMargin = dp(SETTINGS_BLOCK_GAP_DP)
+                })
+                when (page) {
+                    "connection" -> connectionSetup(content)
+                    "settings" -> settingsCategoryContent(content)
+                    "btpair" -> btPairPage(content)
+                    "about" -> about(content)
+                    else -> home(content)
+                }
+                scroll
             }
-            scroll
         }
         setContentView(root)
         renderedPage = page
         renderedSettingsCategory = settingsCategory.takeIf { page == "settings" }
         refreshStatus()
+        syncSpeedListener()
+        syncLyricsSubscription()
         pendingScrollY = previousScrollY
         // A stopped window still dispatches pre-draw but skips layout, so wait for a real layout;
         // the listener stays on this view and goes away with it.
@@ -584,26 +662,57 @@ class DiPlayActivity : ComponentActivity() {
         }
     }
 
+    // fix3: 顶栏去掉 logo 与「车机主页」按钮；非 home 页保留「返回」。
+    // fix5: home 页顶栏右侧加状态点 + 短状态 + 时钟（与 refreshStatus() 同步）。
+    // src2: home 页顶栏不再显示标题（移到 logo 下方），改用等重空白占位，
+    //       右侧状态点+短状态+时钟集群保持右对齐、位置逐像素不变；非 home 页标题照旧。
     private fun standardHeader(compact: Boolean): LinearLayout = row().apply {
         gravity = Gravity.CENTER_VERTICAL
-        addView(ImageView(this@DiPlayActivity).apply {
-            setImageResource(R.drawable.ic_carplay)
-            contentDescription = getString(R.string.carplay)
-        }, LinearLayout.LayoutParams(if (compact) dp(24) else dp(36), if (compact) dp(24) else dp(36)))
-        addView(label(getString(R.string.diplay), if (compact) 18 else 26, TEXT, true).apply {
-            setPadding(if (compact) dp(8) else dp(12), 0, 0, 0)
-        }, LinearLayout.LayoutParams(0, if (compact) dp(36) else dp(56), 1f))
-        if (page != "home" || !compact) {
-            addView(button(if (page == "home") getString(R.string.car_home) else getString(R.string.back), false) {
-                if (page == "home") startActivity(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME))
-                else navigateBack()
-            }, LinearLayout.LayoutParams(if (compact) dp(80) else dp(130), if (compact) dp(36) else dp(56)))
+        if (page == "home") {
+            // src13: 时钟移到顶栏最左，弹性空白居中，状态点+状态文字留在最右。
+            headerClock = label(headerClockText(), 19, TEXT).also { addView(it) }
+            addView(space(0), LinearLayout.LayoutParams(0, if (compact) dp(36) else dp(56), 1f))
+        } else {
+            addView(label(getString(R.string.diplay), if (compact) 18 else 26, TEXT, true).apply {
+                setPadding(if (compact) dp(8) else dp(12), 0, 0, 0)
+            }, LinearLayout.LayoutParams(0, if (compact) dp(36) else dp(56), 1f))
+        }
+        if (page == "home") {
+            headerStatusDot = View(this@DiPlayActivity).apply {
+                background = rounded(MUTED, MUTED)
+            }.also {
+                addView(it, LinearLayout.LayoutParams(dp(9), dp(9)))
+            }
+            headerStatusText = label("", 17, MUTED).apply {
+                setPadding(dp(8), 0, 0, 0)
+            }.also { addView(it) }
+        } else {
+            addView(button(getString(R.string.back), false) { navigateBack() },
+                LinearLayout.LayoutParams(if (compact) dp(80) else dp(130), if (compact) dp(36) else dp(56)))
+        }
+    }
+
+    /** 顶栏时钟文本（HH:mm），render 与状态刷新时各更新一次，不另起计时器。 */
+    private fun headerClockText(): String =
+        java.text.SimpleDateFormat("HH:mm", java.util.Locale.US).format(java.util.Date())
+
+    /** Open the head unit's own system settings directly (no intermediate page), mirroring the mod5 fix. */
+    private fun openSystemSettings() {
+        try {
+            startActivity(Intent(Settings.ACTION_SETTINGS))
+        } catch (e: Exception) {
+            toast(getString(R.string.open_system_settings_failed))
         }
     }
 
     private fun navigateBack() {
         val returnCategory = connectionSettingsReturnCategory
         when {
+            // src13: 蓝牙配对页返回到软件设置的「连接」分类。
+            page == "btpair" -> {
+                page = "settings"
+                settingsCategory = SettingsCategory.CONNECTION
+            }
             page == "connection" && returnCategory != null -> {
                 page = "settings"
                 settingsCategory = returnCategory
@@ -637,36 +746,33 @@ class DiPlayActivity : ComponentActivity() {
             LinearLayout.LayoutParams(if (compact) dp(92) else dp(140), if (compact) dp(44) else dp(52)))
     }
 
+    // fix3: 日产简约风主界面。wide/standard/compact 三档同语言：
+    // kicker → 状态大字 → 连接提示 → 连接按钮 → USB → 选择 iPhone → 热点警告 → 断开 → logo → 功能栏。
+    // 「车机主页」按钮及跳转已彻底移除；其他页面同位置的「返回」不受影响。
     private fun home(content: LinearLayout) {
         val compact = isCompactLayout
         if (compact) {
-            val card = card().apply { setPadding(dp(12), dp(10), dp(12), dp(10)) }
-            status = label(getString(R.string.ready_when_you_are), 16, TEXT, true).apply {
-                setPadding(0, 0, 0, dp(8))
+            // src4-追加3: 间距收紧（padding 10→6，行间距 8→6）
+            val card = column().apply { setPadding(dp(12), dp(6), dp(12), dp(6)) }
+            status = label(getString(R.string.ready_when_you_are), 26, TEXT, true).apply {
+                setPadding(0, 0, 0, dp(6))
             }
             card.addView(status)
-            connectButton = button(getString(R.string.connect_phone), true) {
+            connectButton = homePrimaryButton(getString(R.string.connect_phone)) {
                 if (CarPlayBackgroundSession.hasSession()) openProjection()
                 else connect(true)
             }
-            card.addView(connectButton, matchButton(0, 44))
+            card.addView(connectButton, matchButton(0, 48))
 
-            val buttonRow = row().apply {
-                setPadding(0, dp(8), 0, 0)
-                gravity = Gravity.CENTER_VERTICAL
-            }
-            val usbBtn = button(getString(R.string.connect_with_usb), false) { connect(false) }
-            val settingsBtn = button(getString(R.string.settings), false) { page = "settings"; render() }
-            buttonRow.addView(usbBtn, LinearLayout.LayoutParams(0, dp(38), 1f))
-            buttonRow.addView(space(8), LinearLayout.LayoutParams(dp(8), 1))
-            buttonRow.addView(settingsBtn, LinearLayout.LayoutParams(0, dp(38), 1f))
-            card.addView(buttonRow)
+            val usbBtn = homeGhostButton(getString(R.string.connect_with_usb)) { connect(false) }
+            card.addView(usbBtn, matchButton(6, 42))
+            card.addView(homePairedRow())
 
             disconnectButton = button(getString(R.string.disconnect), false) {
                 disconnectButton?.isEnabled = false
                 CarPlayBackgroundSession.stop { runOnUiThread { refreshStatus() } }
             }.apply { visibility = View.GONE }
-            card.addView(disconnectButton, matchButton(8, 38))
+            card.addView(disconnectButton, matchButton(6, 42))
 
             content.addView(card)
             setupError?.let { content.addView(label(it, 13, WARNING).apply { setPadding(0, dp(6), 0, 0) }) }
@@ -676,88 +782,691 @@ class DiPlayActivity : ComponentActivity() {
         val wide = resources.configuration.screenWidthDp >= 850
         val body = column()
         val left = column()
-        left.addView(label(getString(R.string.your_phone_your_drive), 12, ACCENT, true).apply {
-            if (realSdkInt() >= Build.VERSION_CODES.LOLLIPOP) letterSpacing = .16f
-        })
-        left.addView(label(getString(R.string.a_familiar_drive), if (wide) 42 else 36, TEXT, true).apply { setPadding(0, dp(12), 0, dp(10)) })
-        left.addView(label(getString(R.string.your_maps_music_and_conversations_carplay_right_here_on_yo), 19, MUTED))
-        val card = card()
-        card.addView(label(getString(R.string.wireless_carplay), 12, ACCENT, true).apply {
-            if (realSdkInt() >= Build.VERSION_CODES.LOLLIPOP) letterSpacing = .12f
-        })
-        status = label(getString(R.string.ready_when_you_are), 24, TEXT, true).apply { setPadding(0, dp(10), 0, dp(16)) }
-        card.addView(status)
-        connectButton = button(getString(R.string.connect_phone), true) {
+        left.addView(homeKicker())
+        status = label(getString(R.string.ready_when_you_are), if (wide) 40 else 34, TEXT, true)
+        left.addView(status)
+        left.addView(label(homeConnectionHint(), 15, MUTED))
+        connectButton = homePrimaryButton(getString(R.string.connect_phone)) {
             if (CarPlayBackgroundSession.hasSession()) openProjection()
             else connect(true)
         }
-        card.addView(connectButton, matchButton())
-        val connectionHint = when (AirPlayPersistence.loadWirelessHotspotMode(this)) {
-            WirelessHotspotMode.EXISTING_WIFI -> getString(R.string.existing_wifi_hint)
-            WirelessHotspotMode.MANUAL -> getString(R.string.hotspot_hint_manual)
-            WirelessHotspotMode.HOSTAPD -> getString(R.string.hotspot_hint_hostapd)
-            WirelessHotspotMode.LOCAL_ONLY_HOTSPOT -> getString(R.string.hotspot_hint_local)
-            else -> getString(R.string.hotspot_hint_p2p)
+        val usbButton = homeGhostButton(getString(R.string.connect_with_usb)) { connect(false) }
+        if (wide) {
+            val buttonRow = row().apply { gravity = Gravity.CENTER_VERTICAL }
+            buttonRow.addView(connectButton, LinearLayout.LayoutParams(0, dp(60), 1.3f))
+            buttonRow.addView(space(12), LinearLayout.LayoutParams(dp(12), 1))
+            buttonRow.addView(usbButton, LinearLayout.LayoutParams(0, dp(60), 1f))
+            left.addView(buttonRow)
+        } else {
+            left.addView(connectButton, matchButton(0, 60))
+            // src4-追加3: 按钮行上间距 10→6
+            left.addView(usbButton, matchButton(6, 60))
         }
-        card.addView(label(connectionHint, 15, MUTED).apply { setPadding(0, dp(14), 0, 0) })
-        val startupProblem = hotspotStartupResult?.takeIf {
-            it != CarHotspotTethering.Result.READY && it != CarHotspotTethering.Result.CANCELLED &&
-                CarHotspotSettings.shouldEnable(this, true, AirPlayPersistence.loadWirelessHotspotMode(this)) &&
-                com.shilapi.xcertplay.network.CarHotspotStatus.isEnabled(this) != true
-        }
-        if (startupProblem != null) {
-            card.addView(label(hotspotResultText(startupProblem), 15, WARNING))
-            card.addView(button(getString(R.string.open_car_hotspot_settings), false) { openCarWifiSettings() }, matchButton(10, 56))
-        } else if (carHotspotOff()) {
-            card.addView(label(getString(R.string.msg_car_hotspot_off, AirPlayPersistence.loadManualHotspotSsid(this)), 15, WARNING).apply { setPadding(0, dp(14), 0, 0) })
-            card.addView(button(getString(R.string.open_car_hotspot_settings), false) { openCarWifiSettings() }, matchButton(10, 56))
-        }
-        card.addView(button(getString(R.string.choose_iphone), false) { choosePhone() }, matchButton(16, 56))
+        left.addView(homePairedRow())
         disconnectButton = button(getString(R.string.disconnect), false) {
             disconnectButton?.isEnabled = false
             CarPlayBackgroundSession.stop { runOnUiThread { refreshStatus() } }
         }.apply { visibility = View.GONE }
-        card.addView(disconnectButton, matchButton(10, 56))
-        val right = column().apply { gravity = Gravity.CENTER_HORIZONTAL }
-        val logo = ImageView(this).apply {
-            setImageResource(R.drawable.ic_carplay)
-            contentDescription = getString(R.string.carplay_icon)
-            scaleType = ImageView.ScaleType.FIT_CENTER
-        }
-        val branding = column().apply {
-            gravity = Gravity.CENTER
-            addView(logo, LinearLayout.LayoutParams(dp(96), dp(96)))
-        }
-        right.addView(button(getString(R.string.connect_with_usb), false) { connect(false) }, matchButton())
-        right.addView(label(getString(R.string.plug_your_iphone_into_a_usb_data_port_allow_carplay_when_y), 14, MUTED).apply { gravity = Gravity.CENTER; setPadding(dp(8), dp(10), dp(8), dp(24)) })
-        right.addView(button(getString(R.string.settings), false) { page = "settings"; render() }, matchButton())
-        right.addView(label(getString(R.string.make_diplay_feel_right_for_your_car), 14, MUTED).apply { gravity = Gravity.CENTER; setPadding(0, dp(10), 0, dp(24)) })
-        right.addView(label("${getString(R.string.home_public_preview)}${version()}", 12, MUTED).apply {
-            if (realSdkInt() >= Build.VERSION_CODES.LOLLIPOP) letterSpacing = .08f
-        })
+        left.addView(disconnectButton, matchButton(6, 56))
+
         if (wide) {
-            // Both rows share column widths. The USB button starts at the wireless
-            // card's top edge, independently of hero wrapping or font scaling.
-            fun columns(first: View, second: View, stretchSecond: Boolean = false) = row().apply {
-                gravity = Gravity.TOP
-                addView(first, LinearLayout.LayoutParams(0, -2, 1.6f))
-                addView(space(40), LinearLayout.LayoutParams(dp(40), 1))
-                addView(second, LinearLayout.LayoutParams(0, if (stretchSecond) -1 else -2, 1f))
-            }
-            body.addView(columns(left, branding, true))
-            body.addView(space(26))
-            body.addView(columns(card, right))
+            // src13: 右列删日产标+标题，改为码速块 + 原车蓝牙播放控制行（水平居中）。
+            val right = column().apply { gravity = Gravity.CENTER_HORIZONTAL }
+            right.addView(homeSpeedCluster())
+            val top = row().apply { gravity = Gravity.CENTER_VERTICAL }
+            top.addView(left, LinearLayout.LayoutParams(0, -2, 1.6f))
+            top.addView(space(40), LinearLayout.LayoutParams(dp(40), 1))
+            top.addView(right, LinearLayout.LayoutParams(0, -2, 1f))
+            body.addView(top)
         } else {
             body.addView(left)
-            body.addView(space(26))
-            body.addView(card)
-            body.addView(space(26))
-            body.addView(branding)
-            body.addView(space(24))
-            body.addView(right)
+            body.addView(space(16))
+            // src13: stacked 分支同样换成码速块 + 蓝牙播放控制行（居中）。
+            val cluster = column().apply { gravity = Gravity.CENTER_HORIZONTAL }
+            cluster.addView(homeSpeedCluster())
+            body.addView(cluster)
         }
         setupError?.let { body.addView(label(it, 16, WARNING).apply { setPadding(0, dp(16), 0, 0) }) }
         content.addView(body)
+    }
+
+    // fix5: 已配对设备行（效果图）：有已配对设备显示「已配对：<名> · 更换 ›」，
+    // 否则显示「选择 iPhone ›」；整行点击 = choosePhone()。
+    private fun homePairedRow(): TextView {
+        val paired = DiPlayPreferences.phoneAddress(this) != null
+        val text = if (paired) "已配对：${DiPlayPreferences.phoneName(this)} · 更换 ›"
+                   else "${getString(R.string.choose_iphone)} ›"
+        return label(text, 19, MUTED).apply {
+            gravity = Gravity.LEFT
+            // src4-追加3: 与上方按钮间距 10→6
+            setPadding(0, dp(6), 0, 0)
+            setOnClickListener { choosePhone() }
+        }
+    }
+
+    // ---- fix3 helpers: 主界面简约风组件（样式定义不动，只在 home/header 内局部覆盖） ----
+
+    private fun homeKicker(): TextView = label(getString(R.string.your_phone_your_drive), 12, ACCENT, true).apply {
+        if (realSdkInt() >= Build.VERSION_CODES.LOLLIPOP) letterSpacing = .16f
+    }
+
+    private fun homeLogo(): ImageView = ImageView(this).apply {
+        setImageResource(R.drawable.nissan_logo)
+        contentDescription = getString(R.string.carplay_icon)
+        scaleType = ImageView.ScaleType.FIT_CENTER
+    }
+
+    /** src2: logo 正下方的标题（原顶栏左上标题移位而来，复用 R.string.diplay）。 */
+    private fun homeTitleUnderLogo(): TextView =
+        label(getString(R.string.diplay), if (isCompactLayout) 16 else 20, TEXT, true).apply {
+            gravity = Gravity.CENTER_HORIZONTAL
+            // src4-追加3: 与 logo 间距 10→8
+            setPadding(0, dp(8), 0, 0)
+        }
+
+    /** 连接提示文案：原 home() 里的 WirelessHotspotMode 分支逻辑，原样保留。 */
+    private fun homeConnectionHint(): String = when (AirPlayPersistence.loadWirelessHotspotMode(this)) {
+        WirelessHotspotMode.EXISTING_WIFI -> getString(R.string.existing_wifi_hint)
+        WirelessHotspotMode.MANUAL -> getString(R.string.hotspot_hint_manual)
+        WirelessHotspotMode.LOCAL_ONLY_HOTSPOT -> getString(R.string.hotspot_hint_local)
+        else -> getString(R.string.hotspot_hint_p2p)
+    }
+
+    /** 白底深字主按钮：在 button(true) 基础上局部覆盖背景与字色。 */
+    private fun homePrimaryButton(title: String, click: () -> Unit) = button(title, true, click).apply {
+        background = rounded(0xFFF2F3F5.toInt(), 0xFFF2F3F5.toInt())
+        setTextColor(0xFF0C0E11.toInt())
+    }
+
+    /** 透明底描边次按钮：在 button(false) 基础上局部覆盖背景与字色。 */
+    private fun homeGhostButton(title: String, click: () -> Unit) = button(title, false, click).apply {
+        background = rounded(BG, BORDER)
+        setTextColor(TEXT)
+    }
+
+    // src14（用户口径）：功能栏蓝牙项的标签反映当前选定的 CarPlay 蓝牙来源
+    // （选定的来源 = 手动覆盖优先、无覆盖时跟随自动识别：棒在场且未被排除 → USB）。
+    private fun bluetoothBarText(): String =
+        if (BluetoothSourceOverride.effectiveUsb(this, usbBluetoothDonglePresent())) "蓝牙 · USB" else "蓝牙"
+
+    private fun languageBarText(): String =
+        if (AppLocale.preference(this) == AppLocale.ENGLISH) "中文" else "English"
+
+    /**
+     * src14（用户口径，覆盖 src12/src13 的诊断入口行为）：功能栏蓝牙项点击 =
+     * 手动切换 CarPlay 蓝牙来源（内置 ↔ USB 蓝牙棒），不再打开蓝牙诊断页
+     * （设置内其他诊断入口不受影响）。切到 USB 但没插棒时只提示不切换；
+     * 切换成功后立即重渲染刷新标签，并按仓库惯例标记下次连接生效。
+     */
+    private fun onBluetoothBarClick() {
+        val donglePresent = usbBluetoothDonglePresent()
+        if (BluetoothSourceOverride.effectiveUsb(this, donglePresent)) {
+            BluetoothSourceOverride.save(this, BluetoothSourceOverride.FORCE_BUILTIN)
+            toast(getString(R.string.bt_source_switched_builtin))
+        } else {
+            if (!donglePresent) {
+                toast(getString(R.string.bt_source_no_dongle))
+                return
+            }
+            BluetoothSourceOverride.save(this, BluetoothSourceOverride.FORCE_USB)
+            toast(getString(R.string.bt_source_switched_usb))
+        }
+        markReconnectNeeded()
+        render()
+    }
+
+    /** 功能栏语言项点击：ENGLISH↔SIMPLIFIED_CHINESE 切换，复用 AppLocale.save，API 33 以下 recreate 生效。 */
+    private fun onLanguageBarClick() {
+        val current = AppLocale.preference(this)
+        val next = if (current == AppLocale.ENGLISH) AppLocale.SIMPLIFIED_CHINESE else AppLocale.ENGLISH
+        if (next != current) {
+            AppLocale.save(this, next)
+            if (Build.VERSION.SDK_INT < 33) recreate()
+        }
+    }
+
+    /** 底部功能栏：细线分隔 + 等距文本按钮 + 右端版本号。 */
+    private fun homeFunctionBar(textSize: Int): LinearLayout = column().apply {
+        addView(View(this@DiPlayActivity).apply {
+            setBackgroundColor(BORDER)
+            layoutParams = LinearLayout.LayoutParams(-1, dp(1))
+        })
+        addView(row().apply {
+            gravity = Gravity.CENTER_VERTICAL
+            fun barButton(title: String, click: () -> Unit) = button(title, false, click).apply {
+                setBackgroundColor(0)
+                setTextColor(MUTED)
+                setTextSize(textSize.toFloat())
+                gravity = Gravity.CENTER
+            }
+            addView(barButton(getString(R.string.settings_app_label)) { page = "settings"; render() },
+                LinearLayout.LayoutParams(0, dp(56), 1f))
+            addView(barButton(getString(R.string.system_settings)) { openSystemSettings() },
+                LinearLayout.LayoutParams(0, dp(56), 1f))
+            addView(barButton(bluetoothBarText()) { onBluetoothBarClick() },
+                LinearLayout.LayoutParams(0, dp(56), 1f))
+            addView(barButton(languageBarText()) { onLanguageBarClick() },
+                LinearLayout.LayoutParams(0, dp(56), 1f))
+            addView(label("${getString(R.string.home_public_preview)}${version()}", 12, MUTED).apply {
+                if (realSdkInt() >= Build.VERSION_CODES.LOLLIPOP) letterSpacing = .08f
+                setPadding(dp(8), 0, 0, 0)
+            })
+        })
+    }
+
+    // ---- src13: 主页码速块 + 原车蓝牙播放控制 ----
+
+    private enum class MediaGlyph { PREV, PLAY_PAUSE, NEXT }
+
+    /** 圆形媒体键：半透明强调色填充 + 描边，字形用 Canvas 路径画（老车机缺符号字体字形，不能用 emoji/字符）。 */
+    private inner class MediaGlyphView(private val glyph: MediaGlyph) : View(this@DiPlayActivity) {
+        private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL; color = android.graphics.Color.argb(24, 166, 200, 255)
+        }
+        private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE; color = android.graphics.Color.argb(100, 166, 200, 255)
+            strokeWidth = dp(1).toFloat()
+        }
+        private val glyphPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL; color = TEXT
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val cx = width / 2f
+            val cy = height / 2f
+            val r = minOf(width, height) / 2f - dp(1)
+            canvas.drawCircle(cx, cy, r, fillPaint)
+            canvas.drawCircle(cx, cy, r, strokePaint)
+            val u = r
+            val path = Path()
+            when (glyph) {
+                MediaGlyph.PREV -> {
+                    canvas.drawRect(cx - u * 0.46f, cy - u * 0.32f, cx - u * 0.28f, cy + u * 0.32f, glyphPaint)
+                    path.moveTo(cx + u * 0.42f, cy - u * 0.34f)
+                    path.lineTo(cx + u * 0.42f, cy + u * 0.34f)
+                    path.lineTo(cx - u * 0.20f, cy)
+                }
+                MediaGlyph.NEXT -> {
+                    path.moveTo(cx - u * 0.42f, cy - u * 0.34f)
+                    path.lineTo(cx - u * 0.42f, cy + u * 0.34f)
+                    path.lineTo(cx + u * 0.20f, cy)
+                    canvas.drawPath(path, glyphPaint)
+                    canvas.drawRect(cx + u * 0.28f, cy - u * 0.32f, cx + u * 0.46f, cy + u * 0.32f, glyphPaint)
+                    return
+                }
+                MediaGlyph.PLAY_PAUSE -> {
+                    path.moveTo(cx - u * 0.28f, cy - u * 0.38f)
+                    path.lineTo(cx - u * 0.28f, cy + u * 0.38f)
+                    path.lineTo(cx + u * 0.44f, cy)
+                }
+            }
+            path.close()
+            canvas.drawPath(path, glyphPaint)
+        }
+    }
+
+    private fun mediaGlyphButton(glyph: MediaGlyph, sizeDp: Int, descriptionRes: Int, click: () -> Unit): View =
+        MediaGlyphView(glyph).apply {
+            isClickable = true
+            isFocusable = true
+            contentDescription = getString(descriptionRes)
+            if (realSdkInt() >= Build.VERSION_CODES.M) foreground = focusRing(sizeDp / 2)
+            setOnClickListener { click() }
+            layoutParams = LinearLayout.LayoutParams(dp(sizeDp), dp(sizeDp))
+        }
+
+    /** 码速块（大数字 + km/h）+ 其下原车蓝牙播放控制行，整体水平居中。 */
+    private fun homeSpeedCluster(): LinearLayout = column().apply {
+        gravity = Gravity.CENTER_HORIZONTAL
+        speedValueLabel = label("--", 64, TEXT, true).apply { gravity = Gravity.CENTER }
+        addView(speedValueLabel)
+        addView(label(getString(R.string.home_speed_unit), 13, MUTED).apply { gravity = Gravity.CENTER })
+        val controls = row().apply { gravity = Gravity.CENTER }
+        controls.addView(mediaGlyphButton(MediaGlyph.PREV, 54, R.string.home_media_previous) {
+            dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PREVIOUS)
+        })
+        controls.addView(mediaGlyphButton(MediaGlyph.PLAY_PAUSE, 68, R.string.home_media_play_pause) {
+            dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)
+        }, LinearLayout.LayoutParams(dp(68), dp(68)).apply { marginStart = dp(28) })
+        controls.addView(mediaGlyphButton(MediaGlyph.NEXT, 54, R.string.home_media_next) {
+            dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_NEXT)
+        }, LinearLayout.LayoutParams(dp(54), dp(54)).apply { marginStart = dp(28) })
+        addView(controls, LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(28) })
+        // src13: 蓝牙歌词区（三键行下方）——有歌词才显示，无歌词整区 GONE 不占位。
+        val lyrics = column().apply {
+            gravity = Gravity.CENTER_HORIZONTAL
+            visibility = View.GONE
+        }
+        lyricCurrentLabel = label("", 17, TEXT, true).apply {
+            gravity = Gravity.CENTER
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+        }
+        lyrics.addView(lyricCurrentLabel, LinearLayout.LayoutParams(-1, -2))
+        lyricNextLabel = label("", 13, MUTED).apply {
+            gravity = Gravity.CENTER
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            setPadding(0, dp(4), 0, 0)
+        }
+        lyrics.addView(lyricNextLabel, LinearLayout.LayoutParams(-1, -2))
+        lyricBlock = lyrics
+        addView(lyrics, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(18) })
+    }
+
+    /** 系统媒体键通道（方向盘按键同一路径）：优先 AudioManager 分发，异常时兜底有序广播。 */
+    private fun dispatchMediaKey(keyCode: Int) {
+        val now = SystemClock.uptimeMillis()
+        try {
+            val audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+                ?: throw IllegalStateException("no AudioManager")
+            audioManager.dispatchMediaKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_DOWN, keyCode, 0))
+            audioManager.dispatchMediaKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_UP, keyCode, 0))
+        } catch (e: Exception) {
+            try {
+                sendOrderedBroadcast(Intent(Intent.ACTION_MEDIA_BUTTON).apply {
+                    putExtra(Intent.EXTRA_KEY_EVENT, KeyEvent(now, now, KeyEvent.ACTION_DOWN, keyCode, 0))
+                }, null)
+                sendOrderedBroadcast(Intent(Intent.ACTION_MEDIA_BUTTON).apply {
+                    putExtra(Intent.EXTRA_KEY_EVENT, KeyEvent(now, now, KeyEvent.ACTION_UP, keyCode, 0))
+                }, null)
+            } catch (ignored: Exception) { }
+        }
+    }
+
+    // ---- src13: GPS 码速 ----
+
+    private fun syncSpeedListener() {
+        if (page == "home" && activityResumed && speedValueLabel != null) startSpeedUpdates()
+        else stopSpeedUpdates()
+    }
+
+    private fun startSpeedUpdates() {
+        if (speedListener != null) return
+        val target = speedValueLabel ?: return
+        try {
+            if (Build.VERSION.SDK_INT >= 23 && !hasPreciseLocation()) {
+                target.text = "--"
+                return
+            }
+            val manager = getSystemService(Context.LOCATION_SERVICE) as? LocationManager
+            if (manager == null) {
+                target.text = "--"
+                return
+            }
+            if (!manager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
+                target.text = "--"
+                return
+            }
+            val listener = object : LocationListener {
+                override fun onLocationChanged(location: Location) = updateSpeedLabel(location)
+                override fun onProviderDisabled(provider: String) {
+                    speedValueLabel?.text = "--"
+                }
+                override fun onProviderEnabled(provider: String) { }
+                @Suppress("DEPRECATION")
+                override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) { }
+            }
+            manager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 1000L, 0f, listener)
+            speedLocationManager = manager
+            speedListener = listener
+            runCatching { manager.getLastKnownLocation(LocationManager.GPS_PROVIDER) }
+                .getOrNull()?.let { updateSpeedLabel(it) }
+        } catch (e: Exception) {
+            target.text = "--"
+        }
+    }
+
+    private fun updateSpeedLabel(location: Location) {
+        val target = speedValueLabel ?: return
+        if (!location.hasSpeed()) {
+            target.text = "--"
+            return
+        }
+        val kmh = location.speed * 3.6f
+        target.text = if (kmh < 0.5f) "0" else kmh.roundToInt().toString()
+    }
+
+    private fun stopSpeedUpdates() {
+        val manager = speedLocationManager
+        val listener = speedListener
+        if (manager != null && listener != null) runCatching { manager.removeUpdates(listener) }
+        speedLocationManager = null
+        speedListener = null
+    }
+
+    // ---- src13: 主页蓝牙歌词区（数据层在 HomeLyricsSession，API 21+ 隔离） ----
+
+    private fun syncLyricsSubscription() {
+        if (page == "home" && activityResumed && lyricBlock != null) startLyricsUpdates()
+        else stopLyricsUpdates()
+    }
+
+    private fun startLyricsUpdates() {
+        // MediaSession API 是 21+；低版本系统直接不启用（歌词区保持隐藏）。
+        if (realSdkInt() < Build.VERSION_CODES.LOLLIPOP) return
+        try {
+            if (lyricsSession == null) {
+                lyricsSession = HomeLyricsSession(this) { refreshLyrics() }
+            }
+            lyricsSession?.start()
+            refreshLyrics()
+        } catch (e: Exception) {
+            // 拿不到会话（如无媒体内容控制权限）就静默隐藏，绝不影响其他功能。
+        }
+    }
+
+    private fun stopLyricsUpdates() {
+        try {
+            lyricsSession?.stop()
+        } catch (e: Exception) { }
+    }
+
+    /** 把歌词会话的当前行/下一行刷到主页标签；无歌词时整区 GONE。由会话回调与 1 秒 tick 调用。 */
+    private fun refreshLyrics() {
+        val block = lyricBlock ?: return
+        val current = lyricCurrentLabel ?: return
+        val next = lyricNextLabel ?: return
+        val lines = try { lyricsSession?.currentLines() } catch (e: Exception) { null }
+        if (lines == null || lines.first.isBlank()) {
+            if (block.visibility != View.GONE) block.visibility = View.GONE
+            return
+        }
+        current.text = lines.first
+        val nextText = lines.second?.takeIf { it.isNotBlank() }
+        next.text = nextText.orEmpty()
+        next.visibility = if (nextText != null) View.VISIBLE else View.GONE
+        if (block.visibility != View.VISIBLE) block.visibility = View.VISIBLE
+    }
+
+    // ---- src13: 软件内蓝牙配对页（page="btpair"，用车机自带蓝牙） ----
+
+    @SuppressLint("MissingPermission")
+    private fun btPairPage(content: LinearLayout) {
+        val adapter = btAdapterOrNull()
+        if (adapter == null) {
+            content.addView(label(getString(R.string.bt_pair_unavailable), 15, MUTED))
+            return
+        }
+        // 状态卡：标题 + 状态文字 + 开关 + 重新搜索。
+        val statusCard = card()
+        val statusRow = row().apply { gravity = Gravity.CENTER_VERTICAL }
+        val statusTexts = column()
+        statusTexts.addView(label(getString(R.string.bt_pair_adapter_title), 18, TEXT, true))
+        btPairStatusText = label("", 14, MUTED).apply { setPadding(0, dp(3), 0, 0) }
+        statusTexts.addView(btPairStatusText)
+        statusRow.addView(statusTexts, LinearLayout.LayoutParams(0, -2, 1f))
+        statusRow.addView(Switch(this).apply {
+            isChecked = runCatching { adapter.isEnabled }.getOrDefault(false)
+            setOnCheckedChangeListener { _, checked -> setBtEnabled(checked) }
+        })
+        statusCard.addView(statusRow)
+        statusCard.addView(button(getString(R.string.bt_pair_rescan), false) { startBtDiscovery() }, matchButton(12, 52))
+        content.addView(statusCard, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(SETTINGS_BLOCK_GAP_DP) })
+
+        if (!hasBtPermissions()) {
+            content.addView(label(getString(R.string.bt_pair_permission_note), 14, MUTED).apply {
+                setPadding(0, 0, 0, dp(12))
+            })
+        }
+
+        content.addView(label(getString(R.string.bt_pair_paired_heading), 15, MUTED, true).apply {
+            if (realSdkInt() >= Build.VERSION_CODES.LOLLIPOP) letterSpacing = .12f
+            setPadding(0, 0, 0, dp(10))
+        })
+        val pairedCard = card().apply { setPadding(dp(16), dp(6), dp(16), dp(6)) }
+        btPairPairedList = pairedCard
+        content.addView(pairedCard, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(SETTINGS_BLOCK_GAP_DP) })
+
+        val nearbyHead = row().apply { gravity = Gravity.CENTER_VERTICAL; setPadding(0, 0, 0, dp(10)) }
+        nearbyHead.addView(label(getString(R.string.bt_pair_nearby_heading), 15, MUTED, true).apply {
+            if (realSdkInt() >= Build.VERSION_CODES.LOLLIPOP) letterSpacing = .12f
+        })
+        btPairScanStateText = label("", 13, MUTED).apply { setPadding(dp(10), 0, 0, 0) }
+        nearbyHead.addView(btPairScanStateText)
+        content.addView(nearbyHead)
+        val nearbyCard = card().apply { setPadding(dp(16), dp(6), dp(16), dp(6)) }
+        btPairNearbyList = nearbyCard
+        content.addView(nearbyCard, LinearLayout.LayoutParams(-1, -2))
+
+        refreshBtPairStatus()
+        refreshBtPairLists()
+        startBtPairSession()
+    }
+
+    private fun btAdapterOrNull(): BluetoothAdapter? =
+        try { BluetoothCompat.getAdapter(this) } catch (e: Exception) { null }
+
+    private fun hasBtPermissions(): Boolean {
+        if (Build.VERSION.SDK_INT < 31) return true
+        return checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED &&
+            checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun setBtEnabled(enabled: Boolean) {
+        val adapter = btAdapterOrNull() ?: return
+        try {
+            if (enabled) {
+                if (!adapter.isEnabled && !runCatching { adapter.enable() }.getOrDefault(false)) {
+                    runCatching { startActivity(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE)) }
+                }
+            } else if (adapter.isEnabled) {
+                runCatching { adapter.disable() }
+            }
+        } catch (e: Exception) { }
+        refreshBtPairStatus()
+    }
+
+    private fun startBtPairSession() {
+        if (btPairReceiver == null) {
+            val receiver = object : BroadcastReceiver() {
+                override fun onReceive(context: Context?, intent: Intent?) {
+                    when (intent?.action) {
+                        BluetoothDevice.ACTION_FOUND -> {
+                            @Suppress("DEPRECATION")
+                            val device = intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE) ?: return
+                            onBtDeviceFound(device)
+                        }
+                        BluetoothAdapter.ACTION_DISCOVERY_FINISHED -> {
+                            btPairScanning = false
+                            refreshBtPairStatus()
+                        }
+                        BluetoothDevice.ACTION_BOND_STATE_CHANGED -> {
+                            @Suppress("DEPRECATION")
+                            val device = intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE)
+                            val state = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.BOND_NONE)
+                            val address = try { device?.address } catch (e: Exception) { null }
+                            if (address != null) {
+                                if (state == BluetoothDevice.BOND_BONDED) {
+                                    btPairBonding.remove(address)
+                                    btPairNearby.remove(address)
+                                } else if (state == BluetoothDevice.BOND_NONE) {
+                                    btPairBonding.remove(address)
+                                }
+                            }
+                            refreshBtPairLists()
+                        }
+                        BluetoothAdapter.ACTION_STATE_CHANGED -> {
+                            if (page == "btpair") render()
+                        }
+                    }
+                }
+            }
+            val filter = IntentFilter().apply {
+                addAction(BluetoothDevice.ACTION_FOUND)
+                addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED)
+                addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED)
+                addAction(BluetoothAdapter.ACTION_STATE_CHANGED)
+            }
+            val registered = runCatching {
+                androidx.core.content.ContextCompat.registerReceiver(
+                    this@DiPlayActivity, receiver, filter,
+                    androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED)
+                true
+            }.getOrDefault(false)
+            if (!registered) {
+                runCatching { registerBtReceiverLegacy(receiver, filter) }
+            }
+            btPairReceiver = receiver
+        }
+        startBtDiscovery()
+    }
+
+    @Suppress("DEPRECATION")
+    private fun registerBtReceiverLegacy(receiver: BroadcastReceiver, filter: IntentFilter) {
+        registerReceiver(receiver, filter)
+    }
+
+    private fun stopBtPairSession() {
+        try {
+            val adapter = btAdapterOrNull()
+            if (adapter != null && adapter.isDiscovering) adapter.cancelDiscovery()
+        } catch (e: Exception) { }
+        btPairScanning = false
+        btPairReceiver?.let { receiver ->
+            runCatching { unregisterReceiver(receiver) }
+        }
+        btPairReceiver = null
+        btPairNearby.clear()
+        btPairBonding.clear()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startBtDiscovery() {
+        val adapter = btAdapterOrNull() ?: return
+        try {
+            if (!adapter.isEnabled || !hasBtPermissions()) {
+                btPairScanning = false
+                refreshBtPairStatus()
+                return
+            }
+            if (adapter.isDiscovering) adapter.cancelDiscovery()
+            btPairScanning = runCatching { adapter.startDiscovery() }.getOrDefault(false)
+        } catch (e: Exception) {
+            btPairScanning = false
+        }
+        refreshBtPairStatus()
+    }
+
+    private fun onBtDeviceFound(device: BluetoothDevice) {
+        try {
+            val address = device.address ?: return
+            if (device.bondState == BluetoothDevice.BOND_BONDED) return
+            if (!btPairNearby.containsKey(address)) {
+                btPairNearby[address] = device
+                refreshBtPairLists()
+            }
+        } catch (e: Exception) { }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun pairBtDevice(device: BluetoothDevice) {
+        val address = try { device.address } catch (e: Exception) { null } ?: return
+        try {
+            // 多数蓝牙栈在 discovery 期间 createBond 不稳定，先停搜索再配对。
+            val adapter = btAdapterOrNull()
+            if (adapter != null && adapter.isDiscovering) adapter.cancelDiscovery()
+            btPairScanning = false
+            btPairBonding.add(address)
+            if (!runCatching { device.createBond() }.getOrDefault(false)) btPairBonding.remove(address)
+        } catch (e: Exception) {
+            btPairBonding.remove(address)
+        }
+        refreshBtPairLists()
+        refreshBtPairStatus()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun refreshBtPairStatus() {
+        btPairStatusText?.let { statusLabel ->
+            val adapter = btAdapterOrNull()
+            val enabled = try { adapter?.isEnabled == true } catch (e: Exception) { false }
+            if (adapter == null) {
+                statusLabel.text = getString(R.string.bt_pair_unavailable)
+                statusLabel.setTextColor(MUTED)
+            } else if (enabled) {
+                statusLabel.text = getString(R.string.bt_pair_on)
+                statusLabel.setTextColor(READY)
+            } else {
+                statusLabel.text = getString(R.string.bt_pair_off)
+                statusLabel.setTextColor(MUTED)
+            }
+        }
+        btPairScanStateText?.text = getString(
+            if (btPairScanning) R.string.bt_pair_scanning else R.string.bt_pair_scan_done)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun refreshBtPairLists() {
+        val pairedList = btPairPairedList ?: return
+        val nearbyList = btPairNearbyList ?: return
+        pairedList.removeAllViews()
+        nearbyList.removeAllViews()
+        val adapter = btAdapterOrNull()
+        val bonded = try { adapter?.bondedDevices.orEmpty() } catch (e: Exception) { emptySet() }
+        if (bonded.isEmpty()) {
+            pairedList.addView(label(getString(R.string.bt_pair_paired_empty), 14, MUTED).apply {
+                setPadding(0, dp(10), 0, dp(10))
+            })
+        } else {
+            bonded.forEachIndexed { index, device ->
+                if (index > 0) pairedList.addView(btPairDivider())
+                pairedList.addView(btPairPairedRow(device))
+            }
+        }
+        val nearby = btPairNearby.values.filter { device ->
+            try { device.bondState != BluetoothDevice.BOND_BONDED } catch (e: Exception) { true }
+        }
+        if (nearby.isEmpty()) {
+            nearbyList.addView(label(getString(R.string.bt_pair_nearby_empty), 14, MUTED).apply {
+                setPadding(0, dp(10), 0, dp(10))
+            })
+        } else {
+            nearby.forEachIndexed { index, device ->
+                if (index > 0) nearbyList.addView(btPairDivider())
+                nearbyList.addView(btPairNearbyRow(device))
+            }
+        }
+    }
+
+    private fun btPairDivider(): View = View(this).apply {
+        setBackgroundColor(BORDER)
+        layoutParams = LinearLayout.LayoutParams(-1, dp(1))
+    }
+
+    private fun btPairDeviceName(device: BluetoothDevice): String = try {
+        device.name?.takeIf { it.isNotBlank() } ?: device.address ?: ""
+    } catch (e: Exception) {
+        try { device.address ?: "" } catch (ignored: Exception) { "" }
+    }
+
+    private fun btPairPairedRow(device: BluetoothDevice): View {
+        val rowLayout = row().apply {
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(10), 0, dp(10))
+        }
+        rowLayout.addView(label(btPairDeviceName(device), 16, TEXT), LinearLayout.LayoutParams(0, -2, 1f))
+        rowLayout.addView(label(getString(R.string.bt_pair_paired_state), 13, READY))
+        return rowLayout
+    }
+
+    private fun btPairNearbyRow(device: BluetoothDevice): View {
+        val rowLayout = row().apply {
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(6), 0, dp(6))
+        }
+        rowLayout.addView(label(btPairDeviceName(device), 16, TEXT), LinearLayout.LayoutParams(0, -2, 1f))
+        val address = try { device.address } catch (e: Exception) { null }
+        if (address != null && btPairBonding.contains(address)) {
+            rowLayout.addView(label(getString(R.string.bt_pair_pairing), 13, ACCENT))
+        } else {
+            rowLayout.addView(button(getString(R.string.bt_pair_pair_action), false) {
+                pairBtDevice(device)
+            }, LinearLayout.LayoutParams(-2, dp(48)))
+        }
+        return rowLayout
     }
 
     // Only the category scrolls, so the rail keeps showing where the driver is.
@@ -780,7 +1489,6 @@ class DiPlayActivity : ComponentActivity() {
     }
 
     private fun settingsRail(): LinearLayout = column().apply {
-        background = rounded(SURFACE, BORDER)
         setPadding(dp(12), dp(12), dp(12), dp(12))
         SettingsCategory.entries.forEach { category ->
             addView(settingsRailDestination(category), matchButton(0, 52).apply {
@@ -816,11 +1524,7 @@ class DiPlayActivity : ComponentActivity() {
                 }
                 importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
             }, LinearLayout.LayoutParams(dp(4), dp(34)).apply { marginEnd = dp(10) })
-            addView(ImageView(this@DiPlayActivity).apply {
-                setImageResource(settingsCategoryIcon(category))
-                androidx.core.widget.ImageViewCompat.setImageTintList(this, ColorStateList.valueOf(if (selected) ACCENT else TEXT))
-                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
-            }, LinearLayout.LayoutParams(dp(26), dp(26)).apply { marginEnd = dp(12) })
+
             addView(label(title, 16, if (selected) ACCENT else TEXT, true),
                 LinearLayout.LayoutParams(0, -1, 1f))
             setOnClickListener {
@@ -830,16 +1534,6 @@ class DiPlayActivity : ComponentActivity() {
         }
     }
 
-    private fun settingsCategoryIcon(category: SettingsCategory): Int = when (category) {
-        SettingsCategory.OVERVIEW -> R.drawable.ic_dp_overview
-        SettingsCategory.CONNECTION -> R.drawable.ic_dp_connection
-        SettingsCategory.DISPLAY -> R.drawable.ic_dp_display
-        SettingsCategory.AUDIO -> R.drawable.ic_dp_audio
-        SettingsCategory.NAVIGATION -> R.drawable.ic_dp_navigation
-        SettingsCategory.VEHICLE -> R.drawable.ic_dp_vehicle
-        SettingsCategory.DIAGNOSTICS -> R.drawable.ic_dp_diagnostics
-        SettingsCategory.ADVANCED -> R.drawable.ic_dp_advanced
-    }
 
     private fun settingsCategoryTitle(category: SettingsCategory): String = getString(when (category) {
         SettingsCategory.OVERVIEW -> R.string.settings_overview
@@ -970,7 +1664,6 @@ class DiPlayActivity : ComponentActivity() {
         setPadding(0, 0, 0, 0)
         addView(settingsUtilityRow(
             SettingsCategory.DIAGNOSTICS,
-            R.drawable.ic_dp_diagnostics,
             getString(R.string.settings_diagnostics_summary),
         ), LinearLayout.LayoutParams(-1, dp(72)))
         addView(View(this@DiPlayActivity).apply { setBackgroundColor(BORDER) },
@@ -980,7 +1673,6 @@ class DiPlayActivity : ComponentActivity() {
             })
         addView(settingsUtilityRow(
             SettingsCategory.ADVANCED,
-            R.drawable.ic_dp_advanced,
             getString(R.string.settings_advanced_subtitle),
             warning = true,
         ), LinearLayout.LayoutParams(-1, dp(72)))
@@ -988,11 +1680,9 @@ class DiPlayActivity : ComponentActivity() {
 
     private fun settingsUtilityRow(
         category: SettingsCategory,
-        icon: Int,
         description: String,
         warning: Boolean = false,
     ): LinearLayout = row().apply {
-        val tint = if (warning) WARNING else ACCENT
         gravity = Gravity.CENTER_VERTICAL
         isClickable = true
         isFocusable = true
@@ -1002,11 +1692,6 @@ class DiPlayActivity : ComponentActivity() {
                 android.graphics.drawable.RippleDrawable(ColorStateList.valueOf(RIPPLE), null, null), focusRing(12)))
         }
         setPadding(dp(16), 0, dp(16), 0)
-        addView(ImageView(this@DiPlayActivity).apply {
-            setImageResource(icon)
-            androidx.core.widget.ImageViewCompat.setImageTintList(this, ColorStateList.valueOf(tint))
-            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
-        }, LinearLayout.LayoutParams(dp(28), dp(28)).apply { marginEnd = dp(14) })
         addView(column().apply {
             addView(label(settingsCategoryTitle(category), 17, if (warning) WARNING else TEXT, true))
             addView(label(description, 13, MUTED).apply { setPadding(0, dp(2), 0, 0) })
@@ -1040,7 +1725,8 @@ class DiPlayActivity : ComponentActivity() {
         Unit
     }
 
-    private fun settingsSectionHeading(title: Int) = label(getString(title), 22, TEXT, true).apply {
+    private fun settingsSectionHeading(title: Int) = label(getString(title), 15, MUTED, true).apply {
+        if (realSdkInt() >= Build.VERSION_CODES.LOLLIPOP) letterSpacing = .12f
         setPadding(0, 0, 0, dp(10))
     }
 
@@ -1065,7 +1751,31 @@ class DiPlayActivity : ComponentActivity() {
 
     private fun connectionSettings(content: LinearLayout) {
         settingsPageTitle(content, getString(R.string.connection), getString(R.string.settings_connection_summary))
+        // src13: 「连接」分类顶部加「原车蓝牙配对设置」导航行，进软件内配对页（page="btpair"）。
+        content.addView(btPairNavCard(), LinearLayout.LayoutParams(-1, -2).apply {
+            bottomMargin = dp(SETTINGS_BLOCK_GAP_DP)
+        })
         renderSections(content, SettingsInformationArchitecture.sectionsByCategory.getValue(SettingsCategory.CONNECTION))
+    }
+
+    /** 与 settingsSummaryCard 同款式的导航卡：标题 + 副标题 + 右侧 ›，点击进入配对页。 */
+    private fun btPairNavCard(): LinearLayout = card().apply {
+        setPadding(dp(16), dp(10), dp(16), dp(10))
+        isClickable = true
+        isFocusable = true
+        if (realSdkInt() >= Build.VERSION_CODES.M) {
+            foreground = android.graphics.drawable.LayerDrawable(arrayOf<android.graphics.drawable.Drawable>(
+                android.graphics.drawable.RippleDrawable(ColorStateList.valueOf(RIPPLE), null, null), focusRing(12)))
+        }
+        contentDescription = getString(R.string.bt_pair_title)
+        val texts = column()
+        texts.addView(label(getString(R.string.bt_pair_title), 17, TEXT, true))
+        texts.addView(label(getString(R.string.bt_pair_subtitle), 13, MUTED).apply { setPadding(0, dp(3), 0, 0) })
+        val rowLayout = row().apply { gravity = Gravity.CENTER_VERTICAL }
+        rowLayout.addView(texts, LinearLayout.LayoutParams(0, -2, 1f))
+        rowLayout.addView(label("›", 24, MUTED).apply { gravity = Gravity.CENTER })
+        addView(rowLayout)
+        setOnClickListener { page = "btpair"; render() }
     }
 
     private fun displaySettings(content: LinearLayout) {
@@ -1110,7 +1820,7 @@ class DiPlayActivity : ComponentActivity() {
     private fun vehicleSettings(content: LinearLayout) {
         settingsPageTitle(content, getString(R.string.settings_vehicle), getString(R.string.settings_vehicle_summary))
         renderSections(content, SettingsInformationArchitecture.sectionsByCategory.getValue(SettingsCategory.VEHICLE))
-        section(content, getString(R.string.settings_advanced), R.drawable.ic_dp_advanced) { card ->
+        section(content, getString(R.string.settings_advanced), null) { card ->
             card.addView(label(getString(R.string.settings_vehicle_description), 16, MUTED))
             card.addView(button(getString(R.string.settings_open_advanced), false) {
                 settingsCategory = SettingsCategory.ADVANCED
@@ -1259,7 +1969,7 @@ class DiPlayActivity : ComponentActivity() {
     }
 
     private fun advancedVehicleDataSettings(content: LinearLayout) {
-        section(content, getString(R.string.settings_vehicle), R.drawable.ic_dp_dashboard) { card ->
+        section(content, getString(R.string.settings_vehicle), null) { card ->
             card.addView(button(getString(if (bydVehicleAdvancedExpanded)
                 R.string.hide_advanced_vehicle_data else R.string.advanced_vehicle_data), false) {
                 bydVehicleAdvancedExpanded = !bydVehicleAdvancedExpanded
@@ -1287,7 +1997,7 @@ class DiPlayActivity : ComponentActivity() {
 
     private fun allSettingsSections(content: LinearLayout) {
         filteredSection(content, SettingsSection.CARPLAY_CONTROLS,
-            getString(R.string.carplay_controls), R.drawable.ic_dp_controls) { card ->
+            getString(R.string.carplay_controls), null) { card ->
             val gestureFingers = listOf(2, 3, 4)
             choice(card, getString(R.string.settings_gesture_fingers_label),
                 gestureFingers.map { getString(R.string.settings_gesture_fingers_option, it) },
@@ -1301,9 +2011,9 @@ class DiPlayActivity : ComponentActivity() {
             toggle(card, getString(R.string.right_hand_drive), getString(R.string.place_carplay_s_controls_closer_to_the_driver), AirPlayPersistence.loadRightHandDrive(this)) { AirPlayPersistence.saveRightHandDrive(this, it); markReconnectNeeded() }
         }
         filteredSection(content, SettingsSection.WHEEL_KEYS,
-            getString(R.string.settings_wheel_keys), R.drawable.ic_dp_controls, ::wheelKeysSettings)
+            getString(R.string.settings_wheel_keys), null, ::wheelKeysSettings)
         filteredSection(content, SettingsSection.CONNECTION_SETUP,
-            getString(R.string.connection_setup), R.drawable.ic_dp_connection) { card ->
+            getString(R.string.connection_setup), null) { card ->
             card.addView(label(getString(R.string.choose_how_to_connect_follow_the_setup_steps_and_save_your), 16, MUTED))
             card.addView(button(getString(R.string.open_connection_setup), false, ::openConnectionSetupFromSettings), matchButton(12, 60))
             val customMac = AirPlayPersistence.loadCustomBluetoothMac(this)
@@ -1320,11 +2030,27 @@ class DiPlayActivity : ComponentActivity() {
                 matchButton(12, 60),
             )
             card.addView(label(getString(R.string.settings_car_bluetooth_mac_subtitle), 14, MUTED).apply { setPadding(0, dp(4), 0, 0) })
+            // src4-追加1: 热点信息查看/修改入口（Connection 分类）。与自动配置、直开热点、
+            // iPhone 下发同源（manual 存储槽）；连接设置页的同名编辑入口写同一套键，不存在两套存储。
+            if (AirPlayPersistence.loadWirelessHotspotMode(this) == WirelessHotspotMode.MANUAL) {
+                val hotspotSsid = AirPlayPersistence.loadManualHotspotSsid(this)
+                card.addView(
+                    button("${getString(R.string.car_hotspot_details)} · ${hotspotSsid.ifBlank { getString(R.string.settings_hotspot_credentials_empty) }}", false) {
+                        askHotspotCredentials { ssid, password ->
+                            saveHotspotCredentials(ssid, password)
+                            markReconnectNeeded()
+                            render()
+                        }
+                    },
+                    matchButton(12, 60),
+                )
+                card.addView(label(getString(R.string.settings_hotspot_credentials_subtitle), 14, MUTED).apply { setPadding(0, dp(4), 0, 0) })
+            }
         }
         filteredSection(content, SettingsSection.USB_BLUETOOTH,
-            getString(R.string.settings_usb_bluetooth_title), R.drawable.ic_dp_connection, ::usbBluetoothSettings)
+            getString(R.string.settings_usb_bluetooth_title), null, ::usbBluetoothSettings)
         filteredSection(content, SettingsSection.DIAGNOSTICS,
-            getString(R.string.diagnostics), R.drawable.ic_dp_diagnostics) { card ->
+            getString(R.string.diagnostics), null) { card ->
             // 查看日志按钮：在保存按钮上方，点击直接展示日志（无需先保存）。
             // 低配置车机生成报告会卡顿，按钮显示 loading 状态避免"卡死"错觉。
             val viewLogButton = button(getString(R.string.view_log), false) {}
@@ -1366,7 +2092,7 @@ class DiPlayActivity : ComponentActivity() {
             card.addView(label(destination + getString(R.string.nothing_is_sent_automatically_protocol_payloads_and_creden), 14, MUTED).apply { setPadding(0, dp(12), 0, 0) })
         }
         filteredSection(content, SettingsSection.AUTOMATIC_CONNECTION,
-            getString(R.string.automatic_connection), R.drawable.ic_dp_automation) { card ->
+            getString(R.string.automatic_connection), null) { card ->
             toggle(card, getString(R.string.connect_when_diplay_opens), getString(R.string.default_connection_description), DiPlayPreferences.autoConnect(this)) { DiPlayPreferences.saveAutoConnect(this, it) }
             val connectionModes = DefaultConnectionMode.entries
             choice(card, getString(R.string.default_connection_mode), listOf(
@@ -1415,7 +2141,7 @@ class DiPlayActivity : ComponentActivity() {
         }
         if (settingsSectionFilter?.contains(SettingsSection.BYD_ADB) != false) bydAdbSettings(content)
         filteredSection(content, SettingsSection.DISPLAY_AND_PERFORMANCE,
-            getString(R.string.display_and_performance), R.drawable.ic_dp_display) { card ->
+            getString(R.string.display_and_performance), null) { card ->
             val nightModes = CarPlayNightMode.entries
             val nightMode = AirPlayPersistence.loadCarPlayNightMode(this)
             val ambientControls = column().apply {
@@ -1502,7 +2228,7 @@ class DiPlayActivity : ComponentActivity() {
             card.addView(label(getString(R.string.settings_interface_size_hint), 14, MUTED))
         }
         filteredSection(content, SettingsSection.EXPERIMENTAL_DISPLAY,
-            getString(R.string.settings_experimental_display), R.drawable.ic_dp_display) { card ->
+            getString(R.string.settings_experimental_display), null) { card ->
             toggle(card, getString(R.string.settings_harman_fullscreen_experimental),
                 getString(R.string.settings_harman_fullscreen_experimental_description),
                 AirPlayPersistence.loadHarmanFullscreen(this)) { enabled ->
@@ -1552,7 +2278,7 @@ class DiPlayActivity : ComponentActivity() {
         }
         // Opt-in controls that can cost sound or video on some head units.
         filteredSection(content, SettingsSection.ADVANCED_MEDIA,
-            getString(R.string.settings_advanced_media), R.drawable.ic_dp_advanced) { card ->
+            getString(R.string.settings_advanced_media), null) { card ->
             toggle(card, getString(R.string.efficient_video), getString(R.string.use_hevc_leave_off_for_the_widest_head_unit_compatibility), AirPlayPersistence.loadHevcEnabled(this)) { AirPlayPersistence.saveHevcEnabled(this, it); markReconnectNeeded() }
             toggle(card, getString(R.string.smooth_video), getString(R.string.smooth_video_description),
                 AirPlayPersistence.loadSmoothVideo(this)) {
@@ -1690,9 +2416,9 @@ class DiPlayActivity : ComponentActivity() {
             }
         }
         filteredSection(content, SettingsSection.CAR_BUTTON,
-            getString(R.string.car_button_in_carplay), R.drawable.ic_dp_car) { card -> carButtonCard = card; carButtonControls(card) }
+            getString(R.string.car_button_in_carplay), null) { card -> carButtonCard = card; carButtonControls(card) }
         filteredSection(content, SettingsSection.AUDIO_ROUTING,
-            getString(R.string.audio_routing), R.drawable.ic_dp_audio) { card ->
+            getString(R.string.audio_routing), null) { card ->
             mediaChannelControl(card)
             navigationChannelControl(card)
             // Issues #253/#263: when the head unit merges all audio into one volume,
@@ -1724,7 +2450,7 @@ class DiPlayActivity : ComponentActivity() {
         }
         // Cluster video does not require a BYD navigation broadcast receiver.
         filteredSection(content, SettingsSection.CLUSTER_MAP,
-            getString(R.string.carplay_map_on_instrument_cluster_experimental), R.drawable.ic_dp_dashboard) { card ->
+            getString(R.string.carplay_map_on_instrument_cluster_experimental), null) { card ->
             reconnectingToggle(card, getString(R.string.adb_cluster_activity_mode),
                 getString(R.string.adb_cluster_activity_description), AirPlayPersistence.loadAdbClusterEnabled(this)) {
                 AirPlayPersistence.saveAdbClusterEnabled(this, it)
@@ -1945,16 +2671,15 @@ class DiPlayActivity : ComponentActivity() {
             clusterSongSwitch(card)
         }
         filteredSection(content, SettingsSection.PERMISSIONS_AND_HELP,
-            getString(R.string.permissions_and_connection_help), R.drawable.ic_dp_permissions) { card ->
+            getString(R.string.permissions_and_connection_help), null) { card ->
             card.addView(label(getString(R.string.nearby_devices_connects_your_iphone_microphone_enables_sir), 16, MUTED))
             card.addView(button(getString(R.string.app_permissions), false) { openSystem(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))) }, matchButton(16, 60))
             card.addView(button(getString(R.string.bluetooth_settings), false) { openSystem(Intent(Settings.ACTION_BLUETOOTH_SETTINGS)) }, matchButton(10, 60))
             card.addView(button(getString(R.string.wireless_connection_help), false) { wirelessHelp() }, matchButton(10, 60))
         }
         filteredSection(content, SettingsSection.ABOUT,
-            getString(R.string.about), R.drawable.ic_dp_about) { card ->
+            getString(R.string.about), null) { card ->
             card.addView(button(getString(R.string.about_diplay), false) { page = "about"; render() }, matchButton(0, 60))
-            card.addView(button(getString(R.string.update_check_now), false) { updater.check(manual = true) }, matchButton(10, 60))
         }
         languageSettings(content)
     }
@@ -1964,15 +2689,6 @@ class DiPlayActivity : ComponentActivity() {
         content.addView(label(getString(R.string.carplay_at_home_in_your_car), 20, MUTED).apply { setPadding(0, dp(8), 0, dp(24)) })
         section(content, "${getString(R.string.about_public_preview_prefix)}${version()}") { card ->
             card.addView(label(getString(R.string.an_independent_carplay_receiver_for_android_head_units_wir), 17, TEXT))
-        }
-        section(content, getString(R.string.update_section)) { card ->
-            toggle(card, getString(R.string.update_auto_check),
-                getString(R.string.update_auto_description), updater.autoEnabled()) {
-                updater.setAutoEnabled(it)
-            }
-            card.addView(button(getString(R.string.update_check_now), false) {
-                updater.check(manual = true)
-            }, matchButton(10, 60))
         }
         section(content, getString(R.string.made_possible_by_open_source)) { card ->
             card.addView(label(getString(R.string.receiver_based_on_xcertplay_licensed_under_gpl_3_0_diplay), 16, MUTED))
@@ -2048,7 +2764,7 @@ class DiPlayActivity : ComponentActivity() {
             controls.visibility = View.GONE
             return
         }
-        section(controls, getString(R.string.byd_adb_features), R.drawable.ic_dp_permissions) { card ->
+        section(controls, getString(R.string.byd_adb_features), null) { card ->
             if (AirPlayPersistence.loadWirelessHotspotMode(this) == WirelessHotspotMode.MANUAL) {
                 adbToggle(card, R.string.auto_car_hotspot_title, R.string.auto_car_hotspot_description,
                     read = { CarHotspotSettings.enabled(this) },
@@ -2210,6 +2926,7 @@ class DiPlayActivity : ComponentActivity() {
     // BYD maps the AOSP tether action to its own hotspot screen; other firmware falls back to Wi-Fi settings.
     // BYD shows that screen as a dialog and closes it unless its own settings or the car home screen is on top,
     // so the home screen goes first.
+    // src12（官方逻辑版）：原 FreeAuto 式直开热点已舍弃，直接走官方设置页启发式。
     private fun openCarWifiSettings() {
         // Issues #200 & #207: on custom/legacy head unit ROMs (e.g. Android 4.2/4.4/8.1 Zhangxun, FYT,
         // Allwinner, Neusoft), generic WIFI_TETHER_SETTINGS actions often resolve to normal Wi-Fi client
@@ -2575,10 +3292,12 @@ class DiPlayActivity : ComponentActivity() {
         com.shilapi.xcertplay.orchestration.ManualHotspotValidation.error(ssid, password)?.let { getString(it.messageResource()) }
 
     private fun saveHotspotCredentials(ssid: String, password: String) {
+        // src12（官方逻辑版）：原 fix-auto-config 的单一落盘点（含自动凭据生成）已舍弃，
+        // 改为与官方相同的直接落盘（ssid/passphrase/security/band/channel）。
         AirPlayPersistence.saveManualHotspotSsid(this, ssid)
         AirPlayPersistence.saveManualHotspotPassphrase(this, password)
-        AirPlayPersistence.saveManualHotspotSecurity(this,
-            com.shilapi.xcertplay.orchestration.ManualHotspotValidation.securityFor(password))
+        AirPlayPersistence.saveManualHotspotSecurity(
+            this, com.shilapi.xcertplay.orchestration.ManualHotspotValidation.securityFor(password))
         AirPlayPersistence.saveManualHotspotBand(this, com.shilapi.xcertplay.orchestration.ManualHotspotBand.AUTO)
         AirPlayPersistence.saveManualHotspotChannel(this, 0)
     }
@@ -2872,8 +3591,9 @@ class DiPlayActivity : ComponentActivity() {
         val zoomAvailable = wheelMapZoomAvailable()
         val vehicleKeysOn = WheelZoomSettings.joystick(this) ||
             (zoomAvailable && WheelZoomSettings.enabled(this))
-        if (WheelZoomSettings.siriKey(this) || vehicleKeysOn) wheelKeyServiceControls(card)
+        if (WheelZoomSettings.siriKey(this) || vehicleKeysOn || WheelZoomSettings.customKeys(this)) wheelKeyServiceControls(card)
         siriKeyControls(card)
+        customWheelKeyControls(card)
         // Keep previously configured controls reachable even if package detection misses the car.
         if (byd || zoomAvailable || WheelZoomSettings.joystick(this)) wheelKeyControls(card)
     }
@@ -2930,6 +3650,7 @@ class DiPlayActivity : ComponentActivity() {
                 WheelZoomSettings.Role.JOYSTICK -> R.string.wheel_key_role_joystick
                 WheelZoomSettings.Role.SELECT -> R.string.wheel_key_role_select
                 WheelZoomSettings.Role.SIRI -> null
+                else -> null
             }.takeIf { joystick }
             val names = listOfNotNull(zoomName, joystickName)
             if (names.isEmpty()) continue
@@ -2995,6 +3716,81 @@ class DiPlayActivity : ComponentActivity() {
         card.addView(assign, matchButton(10, 56))
     }
 
+    /** FreeAuto-style generic key learning: per-group learning buttons reusing the existing assign flow. */
+    private fun customWheelKeyControls(card: LinearLayout) {
+        toggle(card, getString(R.string.wheel_custom_keys), getString(R.string.wheel_custom_keys_description),
+            WheelZoomSettings.customKeys(this)) {
+            WheelZoomSettings.setCustomKeys(this, it)
+            render()
+        }
+        if (!WheelZoomSettings.customKeys(this)) return
+        val groups = listOf(
+            R.string.wheel_learn_group_volume to listOf(
+                WheelZoomSettings.Role.VOLUME_UP,
+                WheelZoomSettings.Role.VOLUME_DOWN,
+                WheelZoomSettings.Role.VOLUME_MUTE,
+            ),
+            R.string.wheel_learn_group_media to listOf(
+                WheelZoomSettings.Role.PLAY_PAUSE,
+                WheelZoomSettings.Role.MEDIA_PREVIOUS,
+                WheelZoomSettings.Role.MEDIA_NEXT,
+            ),
+            R.string.wheel_learn_group_phone to listOf(
+                WheelZoomSettings.Role.CALL_ANSWER,
+                WheelZoomSettings.Role.CALL_HANGUP,
+            ),
+            R.string.wheel_learn_group_dpad to listOf(
+                WheelZoomSettings.Role.DPAD_UP,
+                WheelZoomSettings.Role.DPAD_DOWN,
+                WheelZoomSettings.Role.DPAD_LEFT,
+                WheelZoomSettings.Role.DPAD_RIGHT,
+                WheelZoomSettings.Role.DPAD_SELECT,
+                WheelZoomSettings.Role.DPAD_BACK,
+            ),
+            R.string.wheel_learn_group_shortcut to listOf(
+                WheelZoomSettings.Role.SHORTCUT_MAPS,
+                WheelZoomSettings.Role.SHORTCUT_MUSIC,
+                WheelZoomSettings.Role.SHORTCUT_PHONE,
+                WheelZoomSettings.Role.SHORTCUT_SETTINGS,
+            ),
+        )
+        for ((groupTitle, roles) in groups) {
+            card.addView(label(getString(groupTitle), 16, TEXT, true).apply { setPadding(0, dp(12), 0, 0) })
+            if (groupTitle == R.string.wheel_learn_group_shortcut) {
+                card.addView(label(getString(R.string.wheel_learn_shortcut_unwired), 14, MUTED))
+            }
+            for (role in roles) {
+                wheelKeyAssignButton(card, role, getString(wheelLearnRoleName(role)))
+            }
+        }
+        card.addView(button(getString(R.string.wheel_custom_keys_clear), false) {
+            WheelZoomSettings.clearCustomKeys(this)
+            render()
+        }, matchButton(10, 56))
+    }
+
+    private fun wheelLearnRoleName(role: WheelZoomSettings.Role): Int = when (role) {
+        WheelZoomSettings.Role.VOLUME_UP -> R.string.wheel_learn_role_volume_up
+        WheelZoomSettings.Role.VOLUME_DOWN -> R.string.wheel_learn_role_volume_down
+        WheelZoomSettings.Role.VOLUME_MUTE -> R.string.wheel_learn_role_volume_mute
+        WheelZoomSettings.Role.PLAY_PAUSE -> R.string.wheel_learn_role_play_pause
+        WheelZoomSettings.Role.MEDIA_PREVIOUS -> R.string.wheel_learn_role_media_previous
+        WheelZoomSettings.Role.MEDIA_NEXT -> R.string.wheel_learn_role_media_next
+        WheelZoomSettings.Role.CALL_ANSWER -> R.string.wheel_learn_role_call_answer
+        WheelZoomSettings.Role.CALL_HANGUP -> R.string.wheel_learn_role_call_hangup
+        WheelZoomSettings.Role.DPAD_UP -> R.string.wheel_learn_role_dpad_up
+        WheelZoomSettings.Role.DPAD_DOWN -> R.string.wheel_learn_role_dpad_down
+        WheelZoomSettings.Role.DPAD_LEFT -> R.string.wheel_learn_role_dpad_left
+        WheelZoomSettings.Role.DPAD_RIGHT -> R.string.wheel_learn_role_dpad_right
+        WheelZoomSettings.Role.DPAD_SELECT -> R.string.wheel_learn_role_dpad_select
+        WheelZoomSettings.Role.DPAD_BACK -> R.string.wheel_learn_role_dpad_back
+        WheelZoomSettings.Role.SHORTCUT_MAPS -> R.string.wheel_learn_role_shortcut_maps
+        WheelZoomSettings.Role.SHORTCUT_MUSIC -> R.string.wheel_learn_role_shortcut_music
+        WheelZoomSettings.Role.SHORTCUT_PHONE -> R.string.wheel_learn_role_shortcut_phone
+        WheelZoomSettings.Role.SHORTCUT_SETTINGS -> R.string.wheel_learn_role_shortcut_settings
+        else -> wheelKeyRoleName(role)
+    }
+
     private fun wheelKeyRoleName(role: WheelZoomSettings.Role): Int = when (role) {
         WheelZoomSettings.Role.MODE -> R.string.wheel_key_role_mode
         WheelZoomSettings.Role.ZOOM_IN -> R.string.wheel_key_role_zoom_in
@@ -3004,6 +3800,8 @@ class DiPlayActivity : ComponentActivity() {
         WheelZoomSettings.Role.NEXT -> R.string.wheel_key_role_next
         WheelZoomSettings.Role.SELECT -> R.string.wheel_key_role_select
         WheelZoomSettings.Role.SIRI -> R.string.wheel_key_role_siri
+        // Custom roles are named by wheelLearnRoleName; kept total for exhaustiveness.
+        else -> wheelLearnRoleName(role)
     }
 
     private class WindowKeyLearning(
@@ -3850,7 +4648,6 @@ class DiPlayActivity : ComponentActivity() {
 
     private fun reconnectBar(): View = row().apply {
         gravity = Gravity.CENTER_VERTICAL
-        background = rounded(RAIL_SELECTED, RAIL_SELECTED_BORDER)
         setPadding(dp(20), dp(10), dp(12), dp(10))
         addView(label(getString(R.string.settings_reconnect_pending), 16, TEXT), LinearLayout.LayoutParams(0, -2, 1f))
         addView(button(getString(R.string.settings_reconnect_now), true) {
@@ -4696,13 +5493,18 @@ class DiPlayActivity : ComponentActivity() {
 
     private fun refreshStatus() {
         val running = CarPlayBackgroundSession.hasSession()
-        status?.text = when {
+        val statusText = when {
             setupError != null -> getString(R.string.setup_needs_attention)
             CarPlayBackgroundSession.active -> getString(R.string.carplay_connected)
             running -> getString(R.string.connecting_to_your_iphone)
             DiPlayPreferences.phoneAddress(this) != null -> "${getString(R.string.status_ready_for_prefix)}${DiPlayPreferences.phoneName(this)}"
             else -> getString(R.string.ready_when_you_are)
         }
+        status?.text = statusText
+        // fix5: 顶栏状态与大状态同文案、状态点随 running 变色、时钟同步更新。
+        headerStatusText?.text = statusText
+        headerStatusDot?.background = rounded(if (running) ACCENT else MUTED, if (running) ACCENT else MUTED)
+        headerClock?.text = headerClockText()
         if (lastRunning != running) {
             connectButton?.text = if (running) getString(R.string.open_carplay) else getString(R.string.connect_phone)
             disconnectButton?.visibility = if (running) View.VISIBLE else View.GONE
@@ -5090,7 +5892,7 @@ class DiPlayActivity : ComponentActivity() {
     private fun version() = packageManager.getPackageInfo(packageName, 0).versionName ?: "0.1.0-beta.1"
     private fun languageSettings(content: LinearLayout) {
         filteredSection(content, SettingsSection.LANGUAGE,
-            getString(R.string.language_section_title), R.drawable.ic_dp_language) { card ->
+            getString(R.string.language_section_title), null) { card ->
             card.addView(label(getString(R.string.language_hint), 14, MUTED))
             val current = AppLocale.preference(this)
             val languageButton = button("${getString(R.string.language_app_language)} · ${AppLocale.displayName(this, current)}", false) { }
@@ -5103,14 +5905,10 @@ class DiPlayActivity : ComponentActivity() {
         searchIndexSink?.add(title)
         val card = card()
         val heading = row().apply { gravity = Gravity.CENTER_VERTICAL; setPadding(0, 0, 0, dp(16)) }
-        if (icon != null) heading.addView(ImageView(this).apply {
-            setImageDrawable(AppCompatResources.getDrawable(this@DiPlayActivity, icon)?.let {
-                DrawableCompat.wrap(it.mutate()).apply { DrawableCompat.setTint(this, ACCENT) }
-            })
-            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
-        }, LinearLayout.LayoutParams(dp(28), dp(28)).apply { marginEnd = dp(12) })
-        heading.addView(label(title, 22, TEXT, true), LinearLayout.LayoutParams(0, -2, 1f))
+        heading.addView(label(title, 19, TEXT, true), LinearLayout.LayoutParams(0, -2, 1f))
         card.addView(heading)
+        card.addView(View(this).apply { setBackgroundColor(BORDER) },
+            LinearLayout.LayoutParams(-1, dp(1)).apply { topMargin = dp(12) })
         build(card)
         if (page == "settings") normalizeSpacing(card)
         parent.addView(card, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(18) })
@@ -5342,7 +6140,8 @@ class DiPlayActivity : ComponentActivity() {
         private const val ADB_KEY_SAVE_WAIT_MILLIS = 500L
         /** In-app report preview cap: weak head units cannot lay out a huge TextView. */
         private const val REPORT_PREVIEW_CHARS = 100 * 1024
-        private val BG = Color.rgb(12, 17, 27)
+        // src13: 主页设计定版——全局底色改纯黑（卡片色 SURFACE/BUTTON/BORDER 不动）。
+        private val BG = Color.rgb(0, 0, 0)
         private val SURFACE = Color.rgb(21, 30, 44)
         // One step lighter than a card, so a button reads as a button even where its 1 px border is faint.
         private val BUTTON = Color.rgb(31, 43, 61)

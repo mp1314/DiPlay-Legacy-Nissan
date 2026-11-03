@@ -139,6 +139,15 @@ class WheelKeyService : AccessibilityService() {
         refreshEligibility()
         val calling = inCall(this)
         if (calling) clearLearning()
+        // FreeAuto-style custom learned keys dispatch here, before the zoom/joystick path.
+        // While a role is being learned the normal path below assigns the pressed key instead,
+        // so dispatch only runs when no learn session is open (upstream source design; the
+        // v0.2.69 release APK's smali gates this on learning != null, which would only ever
+        // dispatch while a learn session is open).
+        if (learning == null && !calling && WheelZoomSettings.customKeys(this)) {
+            if (WheelCustomDispatch.dispatch(this, this, key, down)) return true
+            return false
+        }
         val enabled = WheelZoomSettings.enabled(this)
         // roleOf ignores whether a role is on, so it could hand the Siri key to an inactive default role.
         val role = when {
@@ -569,6 +578,8 @@ class WheelJoystick {
             WheelZoomSettings.Role.SELECT -> Action.SELECT
             WheelZoomSettings.Role.MODE -> Action.BACK
             WheelZoomSettings.Role.JOYSTICK, WheelZoomSettings.Role.SIRI -> Action.PASS
+            // Custom (learned) roles are dispatched by the key service itself, never by the joystick.
+            else -> Action.PASS
         }
     }
 
@@ -637,6 +648,7 @@ object WheelZoomSettings {
     private const val KEY_JOYSTICK = "joystick"
     private const val KEY_JOYSTICK_AUTO_OFF = "joystick_auto_off"
     private const val KEY_SIRI = "siri_key"
+    private const val KEY_CUSTOM = "custom_keys"
     private const val BYD_KEYS = "simulate-keys"
     const val TIMED_MODE_MILLIS = 5_000L
     const val JOYSTICK_IDLE_MILLIS = 15_000L
@@ -644,8 +656,11 @@ object WheelZoomSettings {
     /**
      * Defaults are a BYD Tang's wheel: the custom key, volume up and down (the roller), the media key,
      * previous, next and play/pause. The Siri key has no default: DiPlay's screen already takes BYD's voice key.
+     *
+     * The CUSTOM roles (FreeAuto-style key learning) have no defaults: the user learns each key on
+     * their own head unit. SHORTCUT_* roles are learn-and-store only; they have no dispatch hook yet.
      */
-    enum class Role(val defaultKey: WheelKey?) {
+    enum class Role(val defaultKey: WheelKey?, val custom: Boolean = false) {
         MODE(WheelKey(305, 300, BYD_KEYS)),
         ZOOM_IN(WheelKey(291, 115, BYD_KEYS)),
         ZOOM_OUT(WheelKey(292, 114, BYD_KEYS)),
@@ -654,6 +669,29 @@ object WheelZoomSettings {
         NEXT(WheelKey(87, 270, BYD_KEYS)),
         SELECT(WheelKey(353, 505, BYD_KEYS)),
         SIRI(null),
+        // Volume group.
+        VOLUME_UP(null, true),
+        VOLUME_DOWN(null, true),
+        VOLUME_MUTE(null, true),
+        // Media group.
+        PLAY_PAUSE(null, true),
+        MEDIA_PREVIOUS(null, true),
+        MEDIA_NEXT(null, true),
+        // Phone group.
+        CALL_ANSWER(null, true),
+        CALL_HANGUP(null, true),
+        // Knob / direction group.
+        DPAD_UP(null, true),
+        DPAD_DOWN(null, true),
+        DPAD_LEFT(null, true),
+        DPAD_RIGHT(null, true),
+        DPAD_SELECT(null, true),
+        DPAD_BACK(null, true),
+        // Quick-open group: learned and stored, dispatch not wired yet.
+        SHORTCUT_MAPS(null, true),
+        SHORTCUT_MUSIC(null, true),
+        SHORTCUT_PHONE(null, true),
+        SHORTCUT_SETTINGS(null, true),
     }
 
     /** The mode key switches zoom mode until pressed again, or turns it on for a few seconds. */
@@ -695,26 +733,49 @@ object WheelZoomSettings {
         WheelKeyService.settingsChanged()
     }
 
+    /** FreeAuto-style generic key learning master switch. */
+    fun customKeys(context: Context): Boolean = prefs(context).getBoolean(KEY_CUSTOM, false)
+
+    fun setCustomKeys(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY_CUSTOM, enabled).apply()
+        WheelKeyService.settingsChanged()
+    }
+
+    /** Clear all learned custom-role keys (keeps the master switch as-is). */
+    fun clearCustomKeys(context: Context) {
+        val edit = prefs(context).edit()
+        Role.entries.filter { it.custom }.forEach { edit.remove("key_${it.name}") }
+        edit.apply()
+        WheelKeyService.settingsChanged()
+    }
+
     /** Whether any setting needs the key service. */
-    fun anyEnabled(context: Context): Boolean = enabled(context) || joystick(context) || siriKey(context)
+    fun anyEnabled(context: Context): Boolean =
+        enabled(context) || joystick(context) || siriKey(context) || customKeys(context)
 
     fun isSiriKey(context: Context, key: WheelKey): Boolean = siriKey(context) && key(context, Role.SIRI) == key
 
     /**
-     * The active role that already has [key], when [role] would share it with the Siri key: [roleOf] gives a
+     * The active role that already has [key], when [role] would share it. [roleOf] gives a
      * shared key to the earlier role, so the Siri key would never fire. Zoom and joystick keys keep their rules.
+     * Custom (learned) roles must be unambiguous: sharing a key with any other active role is refused.
      */
     fun conflict(context: Context, role: Role, key: WheelKey): Role? {
         val zoom = enabled(context)
         val joystick = joystick(context)
+        val custom = customKeys(context)
         val active = Role.entries.filter {
-            when (it) {
-                Role.SIRI -> siriKey(context)
-                Role.MODE, Role.ZOOM_IN, Role.ZOOM_OUT -> zoom || joystick
+            when {
+                it == Role.SIRI -> siriKey(context)
+                it.custom -> custom
+                it == Role.MODE || it == Role.ZOOM_IN || it == Role.ZOOM_OUT -> zoom || joystick
                 else -> joystick
             }
         }
-        return active.firstOrNull { it != role && (it == Role.SIRI || role == Role.SIRI) && key(context, it) == key }
+        return active.firstOrNull {
+            it != role && key(context, it) == key &&
+                (it == Role.SIRI || role == Role.SIRI || it.custom || role.custom)
+        }
     }
 
     fun key(context: Context, role: Role): WheelKey? =
@@ -727,7 +788,11 @@ object WheelZoomSettings {
 
     /** The zoom or joystick role with [key]; [isSiriKey] checks the Siri role, which has its own switch. */
     fun roleOf(context: Context, key: WheelKey): Role? =
-        Role.entries.firstOrNull { it != Role.SIRI && key(context, it) == key }
+        Role.entries.firstOrNull { !it.custom && it != Role.SIRI && key(context, it) == key }
+
+    /** The custom (learned) role with [key], or null. */
+    fun customRoleOf(context: Context, key: WheelKey): Role? =
+        Role.entries.firstOrNull { it.custom && key(context, it) == key }
 
     private fun prefs(context: Context) = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 }

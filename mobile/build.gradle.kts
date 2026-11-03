@@ -73,6 +73,9 @@ android {
         targetCompatibility = JavaVersion.VERSION_11
         isCoreLibraryDesugaringEnabled = true
     }
+    packaging {
+        resources.pickFirsts += "assets/dexopt/baseline.prof"
+    }
 }
 
 val authenticationProbeRuntime by configurations.creating {
@@ -129,8 +132,11 @@ abstract class VerifyDiPlaySigningTask : DefaultTask() {
         val cert = store.getCertificate(alias) ?: throw GradleException("Release signing certificate not found")
         val fingerprint = MessageDigest.getInstance("SHA-256")
             .digest(cert.encoded).joinToString("") { "%02x".format(it.toInt() and 0xff) }
-        check(fingerprint.equals("bca015c0cb43469fee55539b4054ff862671e7b41e6612eee0cb8566d327b7ae", true)) {
-            "Release certificate differs from v0.2.21; refusing to create an update-incompatible APK."
+        // src12 (nissan custom line): this branch is signed with the line's own
+        // freeauto certificate, not the upstream DiPlay key; pin the check to it
+        // so a wrong-key release is still refused.
+        check(fingerprint.equals("fd34b9c61c8be46c05769b7291101905f88621271289019d198f152a0ede4d6f", true)) {
+            "Release certificate differs from the nissan line signing key; refusing to create an update-incompatible APK."
         }
     }
 }
