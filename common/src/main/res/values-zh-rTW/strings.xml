@@ -712,6 +712,12 @@
     <string name="usb_auto_confirm_dialog_msg">自動確認需要無障礙服務。許多車機未提供系統無障礙設定。\n\n此設定也會為主畫面地圖申請使用情況存取權及顯示在其他應用程式上層的權限。現有無障礙服務會保留。\n\n要透過本機 ADB 授予這三項權限嗎？</string>
     <string name="usb_auto_confirm_status_on">USB 提示自動確認：已啟用</string>
     <string name="settings_interface_size">介面大小</string>
+    <string name="settings_home_wallpaper">主頁背景</string>
+    <string name="settings_home_wallpaper_black">純黑</string>
+    <string name="settings_home_wallpaper_midnight_blue">午夜藍</string>
+    <string name="settings_home_wallpaper_carbon_fiber">碳纖維</string>
+    <string name="settings_home_wallpaper_starry_sky">星空</string>
+    <string name="settings_home_wallpaper_graphite">石墨灰</string>
     <string name="settings_interface_size_auto">自動</string>
     <string name="settings_interface_size_hint">DiPlay 自身畫面中文字與控制項的大小。自動模式會在大尺寸低密度螢幕上放大它們。不影響 CarPlay。</string>
     <string name="settings_direct_surface_view">高效硬體圖層渲染（實驗性）</string>

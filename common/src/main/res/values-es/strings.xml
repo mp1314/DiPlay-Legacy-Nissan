@@ -649,6 +649,12 @@
     <string name="car_button_saved_next_connection">Guardado. CarPlay mostrará el nuevo icono y nombre la próxima vez que se conecte.</string>
     <string name="this_head_unit_has_no_image_picker">Esta unidad principal no tiene selector de imágenes.</string>
     <string name="settings_interface_size">Tamaño de la interfaz</string>
+    <string name="settings_home_wallpaper">Fondo de la pantalla de inicio</string>
+    <string name="settings_home_wallpaper_black">Negro</string>
+    <string name="settings_home_wallpaper_midnight_blue">Azul medianoche</string>
+    <string name="settings_home_wallpaper_carbon_fiber">Fibra de carbono</string>
+    <string name="settings_home_wallpaper_starry_sky">Cielo estrellado</string>
+    <string name="settings_home_wallpaper_graphite">Grafito</string>
     <string name="settings_interface_size_auto">Automático</string>
     <string name="settings_interface_size_hint">Tamaño del texto y los controles en las pantallas de DiPlay. Automático los agranda en pantallas grandes de baja densidad. No afecta a CarPlay.</string>
     <string name="settings_direct_surface_view">Renderizado directo en capa de hardware (experimental)</string>

@@ -596,7 +596,13 @@ class DiPlayActivity : ComponentActivity() {
         adbSwitches.clear()
         adbStatus = null
         val compact = isCompactLayout
-        val scroll = ScrollView(this).apply { setBackgroundColor(BG); isFillViewport = true; clipToPadding = false }
+        // src18: 主页壁纸只改主页背景层——根布局贴缓存位图、滚动区改透明透出；
+        // 其他页面与纯黑选项（默认）保持原样。
+        val homeWallpaper = if (page == "home") HomeWallpaper.preference(this) else HomeWallpaper.BLACK
+        val scroll = ScrollView(this).apply {
+            setBackgroundColor(if (homeWallpaper == HomeWallpaper.BLACK) BG else Color.TRANSPARENT)
+            isFillViewport = true; clipToPadding = false
+        }
         rootScroll = scroll
         val content = column()
         scroll.addView(content)
@@ -619,7 +625,8 @@ class DiPlayActivity : ComponentActivity() {
                 else content.setPadding(dp(32), dp(16), dp(32), dp(20))
                 home(content)
                 column().apply {
-                    setBackgroundColor(BG)
+                    if (homeWallpaper == HomeWallpaper.BLACK) setBackgroundColor(BG)
+                    else background = HomeWallpaperDrawable(homeWallpaper)
                     addView(header)
                     addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
                     addView(homeFunctionBar(when {
@@ -2489,6 +2496,10 @@ class DiPlayActivity : ComponentActivity() {
                 InterfaceSize.showPicker(this)
             }, matchButton(12, 60))
             card.addView(label(getString(R.string.settings_interface_size_hint), 14, MUTED))
+            // src18: 主页背景（代码绘制的壁纸，默认纯黑）；单选弹窗与语言选择同款，保存后重渲染。
+            card.addView(button("${getString(R.string.settings_home_wallpaper)} · ${HomeWallpaper.displayName(this, HomeWallpaper.preference(this))}", false) {
+                HomeWallpaper.showPicker(this) { render() }
+            }, matchButton(12, 60))
         }
         filteredSection(content, SettingsSection.EXPERIMENTAL_DISPLAY,
             getString(R.string.settings_experimental_display), null) { card ->

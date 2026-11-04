@@ -183,4 +183,9 @@ internal object DiPlayPreferences {
     fun saveAutoConnect(context: Context, value: Boolean) {
         prefs(context).edit().putBoolean("auto_connect", value).apply()
     }
+    /** src18: 主页壁纸选项（取值见 HomeWallpaper），默认 0=纯黑。 */
+    fun homeWallpaper(context: Context): Int = prefs(context).getInt("home_wallpaper", 0)
+    fun saveHomeWallpaper(context: Context, value: Int) {
+        prefs(context).edit().putInt("home_wallpaper", value).apply()
+    }
 }
