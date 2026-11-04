@@ -667,6 +667,10 @@
     <string name="settings_home_wallpaper_carbon_fiber">Вуглецеве волокно</string>
     <string name="settings_home_wallpaper_starry_sky">Зоряне небо</string>
     <string name="settings_home_wallpaper_graphite">Графітовий</string>
+    <string name="settings_home_wallpaper_night_sakura">Нічна сакура</string>
+    <string name="settings_home_wallpaper_under_the_stars">Під зоряним небом</string>
+    <string name="settings_home_wallpaper_cyber_city">Кібермісто</string>
+    <string name="settings_home_wallpaper_dusk_seaside">Узбережжя в сутінках</string>
     <string name="settings_interface_size_auto">Автоматично</string>
     <string name="settings_interface_size_hint">Розмір тексту й елементів керування на екранах DiPlay. В автоматичному режимі вони збільшуються на великих екранах із низькою щільністю. CarPlay не змінюється.</string>
     <string name="settings_direct_surface_view">Прямий рендеринг апаратного шару (експериментально)</string>

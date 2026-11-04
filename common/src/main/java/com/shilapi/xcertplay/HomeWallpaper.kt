@@ -5,6 +5,7 @@ import android.app.Activity
 import android.app.AlertDialog
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.ColorFilter
@@ -12,6 +13,7 @@ import android.graphics.LinearGradient
 import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.RadialGradient
+import android.graphics.Rect
 import android.graphics.Shader
 import android.graphics.drawable.Drawable
 import com.shilapi.xcertplay.host.R
@@ -22,9 +24,11 @@ import kotlin.math.roundToInt
 import kotlin.random.Random
 
 /**
- * src18: 主页壁纸。全部用代码绘制（不带任何图片资源），配色与纹理照预览脚本
- * render_wallpapers.py 的 draw_bg 四个分支（基准画布 1024x600）。壁纸只作用于主页
- * 背景层；卡片、按钮、功能栏与文字颜色都不动。默认 0=纯黑，与 src17 的主页完全一致。
+ * src18: 主页壁纸，共 9 个选项。0-4 为代码绘制（配色与纹理照预览脚本
+ * render_wallpapers.py 的 draw_bg 四个分支，基准画布 1024x600）；5-8 为内置二次元
+ * 插画（assets/wallpapers 下的 webp 原文件），照 render_anime.py 做 cover 取景 +
+ * 压暗 + 左侧暗角后烘进缓存位图。壁纸只作用于主页背景层；卡片、按钮、功能栏与
+ * 文字颜色都不动。默认 0=纯黑，与 src17 的主页完全一致。
  */
 object HomeWallpaper {
     const val BLACK = 0
@@ -32,8 +36,36 @@ object HomeWallpaper {
     const val CARBON = 2
     const val STARROAD = 3
     const val GRAPHITE = 4
+    const val NIGHT_SAKURA = 5
+    const val UNDER_THE_STARS = 6
+    const val CYBER_CITY = 7
+    const val DUSK_SEASIDE = 8
 
-    val ALL = listOf(BLACK, MIDNIGHT, CARBON, STARROAD, GRAPHITE)
+    val ALL = listOf(
+        BLACK, MIDNIGHT, CARBON, STARROAD, GRAPHITE,
+        NIGHT_SAKURA, UNDER_THE_STARS, CYBER_CITY, DUSK_SEASIDE,
+    )
+
+    /** 5-8 号插画的 assets 路径（0-4 号代码绘制，无文件）。 */
+    fun assetPath(style: Int): String? = when (style) {
+        NIGHT_SAKURA -> "wallpapers/anime_sakura.webp"
+        UNDER_THE_STARS -> "wallpapers/anime_stars.webp"
+        CYBER_CITY -> "wallpapers/anime_cyber.webp"
+        DUSK_SEASIDE -> "wallpapers/anime_sea.webp"
+        else -> null
+    }
+
+    /**
+     * 插画水平取景焦点（0=最左、1=最右；垂直恒居中）。数值按预览检查定版：
+     * 尽量让人物靠右，避开右侧码速/三键区。代码壁纸不用，返回中心 0.5。
+     */
+    fun focusX(style: Int): Float = when (style) {
+        NIGHT_SAKURA -> 0.38f
+        UNDER_THE_STARS -> 0.42f
+        CYBER_CITY -> 0.58f
+        DUSK_SEASIDE -> 0.55f
+        else -> 0.5f
+    }
 
     /** 偏好里存了范围外的值（旧版本/手改）时回落到纯黑。 */
     fun normalize(style: Int): Int = if (style in ALL) style else BLACK
@@ -50,6 +82,10 @@ object HomeWallpaper {
             CARBON -> R.string.settings_home_wallpaper_carbon_fiber
             STARROAD -> R.string.settings_home_wallpaper_starry_sky
             GRAPHITE -> R.string.settings_home_wallpaper_graphite
+            NIGHT_SAKURA -> R.string.settings_home_wallpaper_night_sakura
+            UNDER_THE_STARS -> R.string.settings_home_wallpaper_under_the_stars
+            CYBER_CITY -> R.string.settings_home_wallpaper_cyber_city
+            DUSK_SEASIDE -> R.string.settings_home_wallpaper_dusk_seaside
             else -> R.string.settings_home_wallpaper_black
         },
     )
@@ -121,6 +157,43 @@ internal object HomeWallpaperArt {
         }
     }
 
+    /** 插画可读性处理参数（render_anime.py）：整体压暗黑 alpha 26；左侧暗角 alpha 140 → 0。 */
+    const val IMAGE_DARKEN_ALPHA = 26
+    const val VIGNETTE_MAX_ALPHA = 140
+
+    /** 暗角衰减终点占宽度的比例：脚本在 1024 宽下渐变到 x=640，即 0.625。 */
+    const val VIGNETTE_END_FRACTION = 0.625f
+
+    /** 左侧暗角在像素列 x 处的 alpha：脚本 int(140 * max(0, 1 - x/640))（按宽度缩放）。 */
+    fun vignetteAlpha(x: Int, width: Int): Int {
+        if (width <= 0) return 0
+        val span = VIGNETTE_END_FRACTION * width
+        return (VIGNETTE_MAX_ALPHA * max(0f, 1f - x / span)).toInt().coerceIn(0, VIGNETTE_MAX_ALPHA)
+    }
+
+    data class Crop(val left: Int, val top: Int, val width: Int, val height: Int)
+
+    /**
+     * cover 取景（等价于脚本的 max 缩放 + 裁切）：源图按目标宽高比裁出最大窗口，
+     * 水平位置由 focusX 决定（0=最左、1=最右），垂直恒居中。
+     */
+    fun centerCrop(srcWidth: Int, srcHeight: Int, dstWidth: Int, dstHeight: Int, focusX: Float): Crop {
+        if (srcWidth <= 0 || srcHeight <= 0 || dstWidth <= 0 || dstHeight <= 0) {
+            return Crop(0, 0, max(srcWidth, 0), max(srcHeight, 0))
+        }
+        val dstAspect = dstWidth.toFloat() / dstHeight
+        return if (srcWidth.toFloat() / srcHeight > dstAspect) {
+            val cropWidth = (srcHeight * dstAspect).roundToInt().coerceIn(1, srcWidth)
+            val left = ((srcWidth - cropWidth) * focusX.coerceIn(0f, 1f)).roundToInt()
+                .coerceIn(0, srcWidth - cropWidth)
+            Crop(left, 0, cropWidth, srcHeight)
+        } else {
+            val cropHeight = (srcWidth / dstAspect).roundToInt().coerceIn(1, srcHeight)
+            val top = ((srcHeight - cropHeight) / 2f).roundToInt().coerceIn(0, srcHeight - cropHeight)
+            Crop(0, top, srcWidth, cropHeight)
+        }
+    }
+
     fun render(width: Int, height: Int, style: Int): Bitmap {
         val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bitmap)
@@ -131,6 +204,37 @@ internal object HomeWallpaperArt {
             HomeWallpaper.GRAPHITE -> drawGraphite(canvas, width, height)
             else -> canvas.drawColor(Color.BLACK)
         }
+        return bitmap
+    }
+
+    /**
+     * 5-8 号插画：解码 assets 原图 → 按焦点 cover 取景 → 整体压暗 → 左侧渐变暗角，
+     * 全部烘进目标尺寸位图（由 HomeWallpaperCache 按尺寸+样式缓存，不重复解码）。
+     * 资源缺失/解码失败返回 null，调用方回落纯黑。
+     */
+    fun renderImage(context: Context, width: Int, height: Int, style: Int): Bitmap? {
+        val path = HomeWallpaper.assetPath(style) ?: return null
+        val source = try {
+            context.assets.open(path).use { BitmapFactory.decodeStream(it) }
+        } catch (e: Exception) {
+            null
+        } ?: return null
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        val crop = centerCrop(source.width, source.height, width, height, HomeWallpaper.focusX(style))
+        val srcRect = Rect(crop.left, crop.top, crop.left + crop.width, crop.top + crop.height)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+        canvas.drawBitmap(source, srcRect, Rect(0, 0, width, height), paint)
+        source.recycle()
+        canvas.drawColor(Color.argb(IMAGE_DARKEN_ALPHA, 0, 0, 0))
+        val vignette = Paint().apply {
+            shader = LinearGradient(
+                0f, 0f, VIGNETTE_END_FRACTION * width, 0f,
+                Color.argb(VIGNETTE_MAX_ALPHA, 0, 0, 0), Color.argb(0, 0, 0, 0),
+                Shader.TileMode.CLAMP,
+            )
+        }
+        canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), vignette)
         return bitmap
     }
 
@@ -239,32 +343,41 @@ internal object HomeWallpaperArt {
 
 /**
  * 壁纸位图缓存：key =（宽、高、样式），只保留最近一张。主页重渲染（含码速/歌词驱动的
- * 状态刷新路径）时 Drawable 直接贴缓存位图，不重绘渐变与星点。旧位图不主动 recycle——
- * 被替换掉的上一帧 View 可能还在绘制它，交给 GC 回收（切换尺寸/样式是低频操作）。
+ * 状态刷新路径）时 Drawable 直接贴缓存位图，不重绘渐变/星点、也不重新解码插画原图。
+ * 旧位图不主动 recycle——被替换掉的上一帧 View 可能还在绘制它，交给 GC 回收
+ * （切换尺寸/样式是低频操作）。
  */
 internal object HomeWallpaperCache {
     private var cachedKey: Triple<Int, Int, Int>? = null
     private var cachedBitmap: Bitmap? = null
 
     @Synchronized
-    fun bitmap(width: Int, height: Int, style: Int): Bitmap? {
+    fun bitmap(context: Context, width: Int, height: Int, style: Int): Bitmap? {
         if (style == HomeWallpaper.BLACK || width <= 0 || height <= 0) return null
         val key = Triple(width, height, style)
         val existing = cachedBitmap
         if (cachedKey == key && existing != null && !existing.isRecycled) return existing
-        val rendered = HomeWallpaperArt.render(width, height, style)
+        val rendered = if (HomeWallpaper.assetPath(style) != null) {
+            HomeWallpaperArt.renderImage(context, width, height, style)
+                ?: Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                    .apply { eraseColor(Color.BLACK) }
+        } else {
+            HomeWallpaperArt.render(width, height, style)
+        }
         cachedKey = key
         cachedBitmap = rendered
         return rendered
     }
 }
 
-/** 主页根布局的背景：按自身边界尺寸取缓存位图 1:1 贴图。 */
-internal class HomeWallpaperDrawable(private val style: Int) : Drawable() {
+/** 主页根布局的背景：按自身边界尺寸取缓存位图 1:1 贴图（只持有 applicationContext）。 */
+internal class HomeWallpaperDrawable(context: Context, private val style: Int) : Drawable() {
+    private val appContext: Context = context.applicationContext
+
     override fun draw(canvas: Canvas) {
         val bounds = bounds
         if (bounds.width() <= 0 || bounds.height() <= 0) return
-        val bitmap = HomeWallpaperCache.bitmap(bounds.width(), bounds.height(), style)
+        val bitmap = HomeWallpaperCache.bitmap(appContext, bounds.width(), bounds.height(), style)
         if (bitmap == null) canvas.drawColor(Color.BLACK)
         else canvas.drawBitmap(bitmap, null, bounds, null)
     }

@@ -725,6 +725,10 @@
     <string name="settings_home_wallpaper_carbon_fiber">碳纤维</string>
     <string name="settings_home_wallpaper_starry_sky">星空</string>
     <string name="settings_home_wallpaper_graphite">石墨灰</string>
+    <string name="settings_home_wallpaper_night_sakura">夜樱</string>
+    <string name="settings_home_wallpaper_under_the_stars">星空少女</string>
+    <string name="settings_home_wallpaper_cyber_city">赛博都市</string>
+    <string name="settings_home_wallpaper_dusk_seaside">黄昏海边</string>
     <string name="settings_interface_size_auto">自动</string>
     <string name="settings_interface_size_hint">DiPlay 自身界面中文字和控件的大小。自动模式会在大尺寸低密度屏幕上放大它们。不影响 CarPlay。</string>
     <string name="settings_direct_surface_view">高效硬件图层渲染（实验性）</string>

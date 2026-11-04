@@ -626,7 +626,7 @@ class DiPlayActivity : ComponentActivity() {
                 home(content)
                 column().apply {
                     if (homeWallpaper == HomeWallpaper.BLACK) setBackgroundColor(BG)
-                    else background = HomeWallpaperDrawable(homeWallpaper)
+                    else background = HomeWallpaperDrawable(this@DiPlayActivity, homeWallpaper)
                     addView(header)
                     addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
                     addView(homeFunctionBar(when {
