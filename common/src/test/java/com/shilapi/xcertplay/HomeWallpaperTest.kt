@@ -30,15 +30,15 @@ class HomeWallpaperTest {
     }
 
     @Test fun centerCropUsesFocusOnTheWideAxis() {
-        // 插画原图 2352x1008 进 1024x600：源更宽 → 裁宽，窗口宽 1720、余量 632。
-        val sakura = HomeWallpaperArt.centerCrop(2352, 1008, 1024, 600, 0.38f)
-        assertEquals(HomeWallpaperArt.Crop(240, 0, 1720, 1008), sakura)
-        val cyber = HomeWallpaperArt.centerCrop(2352, 1008, 1024, 600, 0.58f)
-        assertEquals(HomeWallpaperArt.Crop(367, 0, 1720, 1008), cyber)
-        assertEquals(0, HomeWallpaperArt.centerCrop(2352, 1008, 1024, 600, 0f).left)
-        assertEquals(632, HomeWallpaperArt.centerCrop(2352, 1008, 1024, 600, 1f).left)
+        // 插画原图 1280x549（src19 起的内置尺寸）进 1024x600：源更宽 → 裁宽，窗口宽 937、余量 343。
+        val sakura = HomeWallpaperArt.centerCrop(1280, 549, 1024, 600, 0.38f)
+        assertEquals(HomeWallpaperArt.Crop(130, 0, 937, 549), sakura)
+        val cyber = HomeWallpaperArt.centerCrop(1280, 549, 1024, 600, 0.58f)
+        assertEquals(HomeWallpaperArt.Crop(199, 0, 937, 549), cyber)
+        assertEquals(0, HomeWallpaperArt.centerCrop(1280, 549, 1024, 600, 0f).left)
+        assertEquals(343, HomeWallpaperArt.centerCrop(1280, 549, 1024, 600, 1f).left)
         // 焦点越界夹紧到两端。
-        assertEquals(632, HomeWallpaperArt.centerCrop(2352, 1008, 1024, 600, 2f).left)
+        assertEquals(343, HomeWallpaperArt.centerCrop(1280, 549, 1024, 600, 2f).left)
     }
 
     @Test fun centerCropCentersVerticallyWhenSourceIsTaller() {

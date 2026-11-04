@@ -36,6 +36,11 @@ android {
         versionCode = 135
         versionName = "0.3.15"
 
+        // src19 (nissan slim): head units are ARM only; drop the x86/x86_64
+        // emulator native libraries (own JNI + conscrypt AAR) from the APK.
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+        }
     }
 
 
