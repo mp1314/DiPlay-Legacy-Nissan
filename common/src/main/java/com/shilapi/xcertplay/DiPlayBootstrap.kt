@@ -30,9 +30,6 @@ internal object DiPlayBootstrap {
         lastRestoreAttemptMillis = now
         usbBtRestoreTried = true
         if (!AirPlayPersistence.loadUsbBtAutoStart(context)) return
-        // src14 (nissan custom line): the driver forced the built-in stack from
-        // the home function bar — do not auto-enable the excluded dongle.
-        if (!com.shilapi.xcertplay.bluetooth.BluetoothSourceOverride.usbAllowed(context)) return
         val appContext = context.applicationContext
         Thread({
             runCatching {

@@ -10,28 +10,20 @@ class HybridBluetoothAdapter(
     val android: AndroidBluetoothAdapter,
     /** USB dongle stack; preferred for data channels when plugged in. */
     val usbDongle: UsbBtBluetoothAdapter? = null,
-    /**
-     * src14 (nissan custom line): the driver's manual Bluetooth-source
-     * override. When this returns false the dongle is excluded from every
-     * connection decision below, as if it were not plugged in. Defaults to
-     * always-allowed so existing constructions keep the automatic behaviour.
-     */
-    private val usbAllowed: () -> Boolean = { true },
 ) : CarPlayBluetooth, CarPlayBluetoothDiscovery {
 
     companion object {
         private const val TAG = "HybridBluetoothAdapter"
     }
 
-    /** The dongle is present *and* the manual override lets CarPlay use it. */
-    private fun dongleUsable(): Boolean = usbDongle?.isSupported() == true && usbAllowed()
+    /** The dongle is plugged in and its stack is supported (automatic source selection). */
+    private fun dongleUsable(): Boolean = usbDongle?.isSupported() == true
 
     override fun isSupported(): Boolean =
         hsae.isSupported() || android.isSupported() || usbDongle?.isSupported() == true
 
     override fun isEnabled(): Boolean {
-        val dongle = usbDongle
-        if (dongle?.isSupported() == true && usbAllowed()) return dongle.isEnabled()
+        if (usbDongle?.isSupported() == true) return usbDongle.isEnabled()
         if (hsae.isSupported() && hsae.isEnabled()) return true
         return android.isEnabled()
     }
@@ -46,9 +38,8 @@ class HybridBluetoothAdapter(
         // ran when neither HSAE nor Android existed, so on T3 (HSAE present
         // but audio-only) the dongle was never enabled and wireless could
         // never reach it (P0-1). Plugging in a dongle is itself the opt-in.
-        val dongle = usbDongle
-        if (dongle?.isSupported() == true && usbAllowed()) {
-            return dongle.enable()
+        if (usbDongle?.isSupported() == true) {
+            return usbDongle.enable()
         }
         return ok
     }
@@ -80,10 +71,7 @@ class HybridBluetoothAdapter(
         }
         if (hsae.isSupported()) runCatching { addAll(hsae.getPairedDevices()) }
         runCatching { addAll(android.getPairedDevices()) }
-        // Manual override (src14): a forced built-in source also hides the
-        // dongle's paired devices, so the iPhone is chosen on the built-in
-        // adapter it will actually be reached through.
-        if (usbAllowed()) usbDongle?.let { runCatching { addAll(it.getPairedDevices()) } }
+        usbDongle?.let { runCatching { addAll(it.getPairedDevices()) } }
         return merged
     }
 
@@ -114,9 +102,7 @@ class HybridBluetoothAdapter(
 
     // ------------------------------------------------------------------
     // CarPlayBluetoothDiscovery (src15): "car finds phone" lives only on
-    // the USB dongle stack. The manual source override gates it exactly
-    // like every other dongle decision: a forced built-in source means
-    // the dongle does not exist as far as callers are concerned.
+    // the USB dongle stack and is available whenever a dongle is present.
     // ------------------------------------------------------------------
 
     override fun isDiscoverySupported(): Boolean = dongleUsable()
@@ -146,11 +132,11 @@ class HybridBluetoothAdapter(
     override fun isPaired(address: String): Boolean = usbDongle?.isPaired(address) == true
 
     override fun pairedDevices(): List<CarPlayBluetoothDevice> =
-        if (usbAllowed()) usbDongle?.getPairedDevices().orEmpty() else emptyList()
+        usbDongle?.getPairedDevices().orEmpty()
 
     override fun openRfcommStream(deviceAddress: String, uuid: String): BlockingDuplexByteStream {
         val dongle = usbDongle
-        if (dongle?.isSupported() == true && usbAllowed()) {
+        if (dongle?.isSupported() == true) {
             if (!dongle.isEnabled()) throw java.io.IOException("USB Bluetooth not enabled")
             // An iAP2 advertisement and bond belong to one local adapter address.
             // Switching to GOC/HSAE cannot resume the dongle's connection.

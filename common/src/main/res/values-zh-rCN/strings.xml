@@ -857,9 +857,6 @@
     <string name="home_media_play_pause">播放/暂停</string>
     <string name="home_media_next">下一曲</string>
     <string name="bt_pair_title">原车蓝牙配对设置</string>
-    <string name="bt_source_switched_usb">已切换到 USB 蓝牙</string>
-    <string name="bt_source_switched_builtin">已切换到内置蓝牙</string>
-    <string name="bt_source_no_dongle">未检测到 USB 蓝牙棒</string>
     <string name="bt_pair_subtitle">在软件内搜索并配对车机蓝牙设备</string>
     <string name="bt_pair_adapter_title">车机蓝牙</string>
     <string name="bt_pair_on">已开启</string>
@@ -878,7 +875,6 @@
     <string name="bt_pair_unavailable">这台车机没有蓝牙适配器。</string>
     <string name="bt_pair_source_external">外置蓝牙（USB）</string>
     <string name="bt_pair_usb_absent">未插入 USB 蓝牙棒。</string>
-    <string name="bt_pair_usb_forced_builtin">蓝牙来源已设为仅内置，外置蓝牙搜索不可用。请先在主页功能栏的蓝牙项切换来源。</string>
     <string name="bt_pair_usb_session_busy">CarPlay 会话正在运行或连接中，结束会话后才能搜索，以免干扰连接。</string>
     <string name="bt_pair_usb_ready">已就绪，可以搜索</string>
     <string name="bt_pair_usb_not_enabled">USB 蓝牙棒尚未启用。</string>

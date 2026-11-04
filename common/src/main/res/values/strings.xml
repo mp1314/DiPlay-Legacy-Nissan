@@ -894,9 +894,6 @@
     <string name="home_media_play_pause">Play / pause</string>
     <string name="home_media_next">Next track</string>
     <string name="bt_pair_title">Car Bluetooth pairing</string>
-    <string name="bt_source_switched_usb">Switched to USB Bluetooth</string>
-    <string name="bt_source_switched_builtin">Switched to built-in Bluetooth</string>
-    <string name="bt_source_no_dongle">No USB Bluetooth dongle detected</string>
     <string name="bt_pair_subtitle">Search for and pair the car Bluetooth devices in the app</string>
     <string name="bt_pair_adapter_title">Car Bluetooth</string>
     <string name="bt_pair_on">On</string>
@@ -915,7 +912,6 @@
     <string name="bt_pair_unavailable">This head unit has no Bluetooth adapter.</string>
     <string name="bt_pair_source_external">External Bluetooth (USB)</string>
     <string name="bt_pair_usb_absent">No USB Bluetooth dongle is plugged in.</string>
-    <string name="bt_pair_usb_forced_builtin">The Bluetooth source is set to built-in only, so external Bluetooth search is unavailable. Switch the source with the Bluetooth item on the home screen first.</string>
     <string name="bt_pair_usb_session_busy">A CarPlay session is active or connecting. End it before searching, so the search cannot disturb the connection.</string>
     <string name="bt_pair_usb_ready">Ready to search</string>
     <string name="bt_pair_usb_not_enabled">The USB Bluetooth dongle is not enabled yet.</string>

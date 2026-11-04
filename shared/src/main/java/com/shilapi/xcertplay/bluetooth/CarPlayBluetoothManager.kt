@@ -15,10 +15,6 @@ object CarPlayBluetoothManager {
                 // USB dongle stack: constructed lazily; enable() is opt-in and
                 // only auto-runs when no other stack exists (see Hybrid).
                 UsbBtBluetoothAdapter(context.applicationContext),
-                // src14 (nissan custom line): the driver's manual source
-                // override from the home function bar gates every dongle
-                // decision in the hybrid adapter.
-                usbAllowed = { BluetoothSourceOverride.usbAllowed(context.applicationContext) },
             ).also { instance = it }
         }
     }

@@ -60,7 +60,6 @@ import androidx.core.view.WindowInsetsControllerCompat
 import com.shilapi.xcertplay.adb.LocalAdb
 import com.shilapi.xcertplay.bluetooth.BluetoothAddressResolver
 import com.shilapi.xcertplay.bluetooth.BluetoothPairResult
-import com.shilapi.xcertplay.bluetooth.BluetoothSourceOverride
 import com.shilapi.xcertplay.bluetooth.CarPlayBluetoothDiscovery
 import com.shilapi.xcertplay.bluetooth.CarPlayBluetoothManager
 // Aliased: DiPlayActivity has its own nested DiscoveredBluetoothDevice
@@ -902,36 +901,13 @@ class DiPlayActivity : ComponentActivity() {
         setTextColor(TEXT)
     }
 
-    // src14（用户口径）：功能栏蓝牙项的标签反映当前选定的 CarPlay 蓝牙来源
-    // （选定的来源 = 手动覆盖优先、无覆盖时跟随自动识别：棒在场且未被排除 → USB）。
+    // src16（用户口径）：功能栏蓝牙项只做自动识别显示（棒在场 → USB），不可点击
+    // （src14 的手动切换来源已按用户要求撤销，蓝牙来源回到纯自动识别）。
     private fun bluetoothBarText(): String =
-        if (BluetoothSourceOverride.effectiveUsb(this, usbBluetoothDonglePresent())) "蓝牙 · USB" else "蓝牙"
+        if (usbBluetoothDonglePresent()) "蓝牙 · USB" else "蓝牙"
 
     private fun languageBarText(): String =
         if (AppLocale.preference(this) == AppLocale.ENGLISH) "中文" else "English"
-
-    /**
-     * src14（用户口径，覆盖 src12/src13 的诊断入口行为）：功能栏蓝牙项点击 =
-     * 手动切换 CarPlay 蓝牙来源（内置 ↔ USB 蓝牙棒），不再打开蓝牙诊断页
-     * （设置内其他诊断入口不受影响）。切到 USB 但没插棒时只提示不切换；
-     * 切换成功后立即重渲染刷新标签，并按仓库惯例标记下次连接生效。
-     */
-    private fun onBluetoothBarClick() {
-        val donglePresent = usbBluetoothDonglePresent()
-        if (BluetoothSourceOverride.effectiveUsb(this, donglePresent)) {
-            BluetoothSourceOverride.save(this, BluetoothSourceOverride.FORCE_BUILTIN)
-            toast(getString(R.string.bt_source_switched_builtin))
-        } else {
-            if (!donglePresent) {
-                toast(getString(R.string.bt_source_no_dongle))
-                return
-            }
-            BluetoothSourceOverride.save(this, BluetoothSourceOverride.FORCE_USB)
-            toast(getString(R.string.bt_source_switched_usb))
-        }
-        markReconnectNeeded()
-        render()
-    }
 
     /** 功能栏语言项点击：ENGLISH↔SIMPLIFIED_CHINESE 切换，复用 AppLocale.save，API 33 以下 recreate 生效。 */
     private fun onLanguageBarClick() {
@@ -961,8 +937,10 @@ class DiPlayActivity : ComponentActivity() {
                 LinearLayout.LayoutParams(0, dp(56), 1f))
             addView(barButton(getString(R.string.system_settings)) { openSystemSettings() },
                 LinearLayout.LayoutParams(0, dp(56), 1f))
-            addView(barButton(bluetoothBarText()) { onBluetoothBarClick() },
-                LinearLayout.LayoutParams(0, dp(56), 1f))
+            // src16: 蓝牙项纯显示（自动识别结果），不可点击。
+            addView(label(bluetoothBarText(), textSize, MUTED).apply {
+                gravity = Gravity.CENTER
+            }, LinearLayout.LayoutParams(0, dp(56), 1f))
             addView(barButton(languageBarText()) { onLanguageBarClick() },
                 LinearLayout.LayoutParams(0, dp(56), 1f))
             addView(label("${getString(R.string.home_public_preview)}${version()}", 12, MUTED).apply {
@@ -1563,10 +1541,9 @@ class DiPlayActivity : ComponentActivity() {
         content.addView(nearbyCard, LinearLayout.LayoutParams(-1, -2))
 
         // 棒在场但 HCI 还没起来时（开机自动恢复是异步的），在本页显式补一次
-        // 启用，成功后回主线程刷新状态。强制内置（来源覆盖）或 CarPlay
-        // 会话中不启用，门控与开机恢复逻辑保持一致。
+        // 启用，成功后回主线程刷新状态。CarPlay 会话中不启用。
         if (present && dongle?.isEnabled() != true &&
-            BluetoothSourceOverride.usbAllowed(this) && !CarPlayBackgroundSession.hasSession()
+            !CarPlayBackgroundSession.hasSession()
         ) {
             Thread({
                 val ok = runCatching {
@@ -1586,18 +1563,12 @@ class DiPlayActivity : ComponentActivity() {
         val statusLabel = btPairUsbStatusText ?: return
         val dongle = CarPlayBluetoothManager.get(this).usbDongle
         val present = dongle?.isSupported() == true
-        val forcedBuiltin =
-            BluetoothSourceOverride.load(this) == BluetoothSourceOverride.FORCE_BUILTIN
         val sessionBusy = CarPlayBackgroundSession.hasSession()
         val enabled = dongle?.isEnabled() == true
         when {
             !present -> {
                 statusLabel.text = getString(R.string.bt_pair_usb_absent)
                 statusLabel.setTextColor(MUTED)
-            }
-            forcedBuiltin -> {
-                statusLabel.text = getString(R.string.bt_pair_usb_forced_builtin)
-                statusLabel.setTextColor(WARNING)
             }
             sessionBusy -> {
                 statusLabel.text = getString(R.string.bt_pair_usb_session_busy)
@@ -1613,7 +1584,7 @@ class DiPlayActivity : ComponentActivity() {
             }
         }
         btPairUsbSearchButton?.isEnabled =
-            present && !forcedBuiltin && !sessionBusy && enabled && !btPairUsbScanning
+            present && !sessionBusy && enabled && !btPairUsbScanning
         btPairUsbScanStateText?.text = getString(
             if (btPairUsbScanning) R.string.bt_pair_scanning else R.string.bt_pair_scan_done)
     }
