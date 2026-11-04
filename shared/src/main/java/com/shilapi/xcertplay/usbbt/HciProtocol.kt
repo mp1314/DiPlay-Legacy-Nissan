@@ -583,72 +583,95 @@ object HciProtocol {
             ((params[at + 2].toInt() and 0xFF) shl 16)
 
     /**
-     * Parse Inquiry Result (0x02): Num_Responses(1), then per response
-     * BD_ADDR(6) | Page_Scan_Repetition_Mode(1) | Reserved(2) |
-     * Class_of_Device(3) | Clock_Offset(2) — 14 bytes each. Truncated
-     * tails are dropped rather than failing the whole event.
+     * Shared parse for the three inquiry result events.
+     *
+     * Core Spec Vol 4, Part E, 6: the parameters are NOT per-response
+     * records. After Num_Responses(1) the fields are grouped — all
+     * BD_ADDRs (6 each), then all Page_Scan_Repetition_Modes (1), then
+     * the Reserved group, then all Class_of_Devices (3), then all
+     * Clock_Offsets (2), then (0x22/0x2F only) all RSSI bytes (1, signed),
+     * then (0x2F only) all EIR blocks (240). A per-response record walk
+     * coincides with this layout only when Num_Responses == 1, which is
+     * why single-device results used to parse while real multi-device
+     * results were garbage (src17 fix). The Reserved group also differs
+     * per event: 2 bytes per response for 0x02, only 1 for 0x22/0x2F —
+     * reading 0x22 with 2 shifted its CoD and RSSI one byte late even for
+     * a single response, so no found device ever classified as a phone.
+     *
+     * A response is emitted only when every one of its field slices lies
+     * inside the buffer; slice ends grow monotonically with the response
+     * index, so the first incomplete response ends the parse and a
+     * truncated tail drops just the incomplete responses.
      */
-    fun parseInquiryResult(event: HciEvent): List<InquiryDevice> {
-        if (event.code != EVT_INQUIRY_RESULT || event.params.isEmpty()) return emptyList()
-        val count = event.params[0].toInt() and 0xFF
-        val complete = minOf(count, (event.params.size - 1) / 14)
-        return (0 until complete).map { i ->
-            val at = 1 + i * 14
-            InquiryDevice(
-                address = parseBdAddrBytes(event.params, at) ?: "",
-                name = null,
-                rssi = null,
-                classOfDevice = inquiryCod(event.params, at + 9),
-            )
-        }.filter { it.address.isNotEmpty() }
-    }
-
-    /**
-     * Parse Inquiry Result with RSSI (0x22): same 14-byte records as the
-     * standard result, then one signed RSSI byte per response appended
-     * after the last record.
-     */
-    fun parseInquiryResultWithRssi(event: HciEvent): List<InquiryDevice> {
-        if (event.code != EVT_INQUIRY_RESULT_WITH_RSSI || event.params.isEmpty()) return emptyList()
-        val count = event.params[0].toInt() and 0xFF
-        val complete = minOf(count, (event.params.size - 1) / 14)
-        val rssiBase = 1 + count * 14
-        return (0 until complete).map { i ->
-            val at = 1 + i * 14
-            InquiryDevice(
-                address = parseBdAddrBytes(event.params, at) ?: "",
-                name = null,
-                rssi = if (rssiBase + i < event.params.size) event.params[rssiBase + i].toInt() else null,
-                classOfDevice = inquiryCod(event.params, at + 9),
-            )
-        }.filter { it.address.isNotEmpty() }
-    }
-
-    /**
-     * Parse Extended Inquiry Result (0x2F): Num_Responses(1), then per
-     * response BD_ADDR(6) | Page_Scan_Repetition_Mode(1) | Reserved(1) |
-     * Class_of_Device(3) | Clock_Offset(2) | RSSI(1) | EIR data(240) —
-     * 254 bytes each. The device name comes from the EIR Complete /
-     * Shortened Local Name entries when present.
-     */
-    fun parseExtendedInquiryResult(event: HciEvent): List<InquiryDevice> {
-        if (event.code != EVT_EXTENDED_INQUIRY_RESULT || event.params.isEmpty()) return emptyList()
-        val count = event.params[0].toInt() and 0xFF
-        val complete = minOf(count, (event.params.size - 1) / 254)
-        return (0 until complete).map { i ->
-            val at = 1 + i * 254
-            val eirStart = at + 14
-            val eirEnd = minOf(eirStart + 240, event.params.size)
-            InquiryDevice(
-                address = parseBdAddrBytes(event.params, at) ?: "",
-                name = if (eirEnd > eirStart) {
-                    parseEirLocalName(event.params.copyOfRange(eirStart, eirEnd))
+    private fun parseInquiryFields(
+        event: HciEvent,
+        expectedCode: Int,
+        reservedBytes: Int,
+        hasRssi: Boolean,
+        eirSize: Int,
+    ): List<InquiryDevice> {
+        if (event.code != expectedCode || event.params.isEmpty()) return emptyList()
+        val params = event.params
+        val count = params[0].toInt() and 0xFF
+        if (count == 0) return emptyList()
+        val addrBase = 1
+        val codBase = addrBase + count * 7 + reservedBytes * count
+        val clockBase = codBase + count * 3
+        val rssiBase = clockBase + count * 2
+        val eirBase = rssiBase + count
+        // Exclusive end of response i's slice of the LAST field group;
+        // every earlier group's slice for response i ends no later.
+        fun lastSliceEnd(i: Int): Int = when {
+            eirSize > 0 -> eirBase + eirSize * (i + 1)
+            hasRssi -> rssiBase + (i + 1)
+            else -> clockBase + 2 * (i + 1)
+        }
+        val out = ArrayList<InquiryDevice>(count)
+        for (i in 0 until count) {
+            if (lastSliceEnd(i) > params.size) break
+            val address = parseBdAddrBytes(params, addrBase + 6 * i) ?: continue
+            out += InquiryDevice(
+                address = address,
+                name = if (eirSize > 0) {
+                    val eirStart = eirBase + eirSize * i
+                    parseEirLocalName(params.copyOfRange(eirStart, eirStart + eirSize))
                 } else null,
-                rssi = event.params[at + 13].toInt(),
-                classOfDevice = inquiryCod(event.params, at + 8),
+                rssi = if (hasRssi) params[rssiBase + i].toInt() else null,
+                classOfDevice = inquiryCod(params, codBase + 3 * i),
             )
-        }.filter { it.address.isNotEmpty() }
+        }
+        return out
     }
+
+    /**
+     * Parse Inquiry Result (0x02): Num_Responses(1), then field groups
+     * BD_ADDR(6) | Page_Scan_Repetition_Mode(1) | Reserved(2) |
+     * Class_of_Device(3) | Clock_Offset(2), each repeated per response.
+     */
+    fun parseInquiryResult(event: HciEvent): List<InquiryDevice> =
+        parseInquiryFields(event, EVT_INQUIRY_RESULT, reservedBytes = 2, hasRssi = false, eirSize = 0)
+
+    /**
+     * Parse Inquiry Result with RSSI (0x22): same field groups as the
+     * standard result but Reserved is 1 byte per response, and an RSSI
+     * group (1 signed byte per response) follows the Clock_Offsets.
+     */
+    fun parseInquiryResultWithRssi(event: HciEvent): List<InquiryDevice> =
+        parseInquiryFields(
+            event, EVT_INQUIRY_RESULT_WITH_RSSI, reservedBytes = 1, hasRssi = true, eirSize = 0,
+        )
+
+    /**
+     * Parse Extended Inquiry Result (0x2F): the 0x22 groups (Reserved 1
+     * byte per response), then a 240-byte EIR block per response. The
+     * device name comes from the EIR Complete / Shortened Local Name
+     * entries when present. One response already fills the 255-byte
+     * parameter limit, so Num_Responses is 1 in any real event.
+     */
+    fun parseExtendedInquiryResult(event: HciEvent): List<InquiryDevice> =
+        parseInquiryFields(
+            event, EVT_EXTENDED_INQUIRY_RESULT, reservedBytes = 1, hasRssi = true, eirSize = 240,
+        )
 
     /**
      * Extract the local name from EIR data: a sequence of

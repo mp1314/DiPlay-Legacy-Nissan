@@ -201,31 +201,54 @@ class HciProtocolTest {
         )
     }
 
+    // All inquiry vectors below are assembled byte-by-byte from the Core
+    // Spec field-group layout (all BD_ADDRs, then all PSRMs, then the
+    // Reserved group, then all CoDs, then all Clock_Offsets, then the
+    // RSSI / EIR groups) — never from the parser's own assumptions. The
+    // src15 vectors for 0x22 encoded a 2-byte Reserved field (copied from
+    // the buggy implementation) and never asserted the CoD, which is why
+    // the one-byte shift shipped unnoticed.
+
     @Test
-    fun parseInquiryResultEvent() {
-        // 0x02 | num=1 | BD_ADDR LSB-first | PSRM | reserved x2 | CoD 0x5A020C (phone) | clock
+    fun parseInquiryResultMultiResponse() {
+        // 0x02, Num_Responses=2, Reserved group is 2 bytes per response.
         val params = byteArrayOf(
-            0x01,
+            0x02,
+            // BD_ADDR group (LSB first): A, then B.
             0xF6.toByte(), 0xE5.toByte(), 0xD4.toByte(), 0xC3.toByte(), 0xB2.toByte(), 0xA1.toByte(),
-            0x01, 0x00, 0x00,
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+            // Page_Scan_Repetition_Mode group: A, B.
+            0x01, 0x02,
+            // Reserved group (2 per response).
+            0x00, 0x00, 0x00, 0x00,
+            // Class_of_Device group: A = 0x5A020C (phone), B = 0x200404.
             0x0C, 0x02, 0x5A,
+            0x04, 0x04, 0x20,
+            // Clock_Offset group: A, B.
             0x34, 0x12,
+            0x78, 0x56,
         )
         val devices = HciProtocol.parseInquiryResult(HciProtocol.HciEvent(0x02, params))
-        assertEquals(1, devices.size)
+        assertEquals(2, devices.size)
         assertEquals("A1:B2:C3:D4:E5:F6", devices[0].address)
         assertEquals(0x5A020C, devices[0].classOfDevice)
         assertNull(devices[0].name)
         assertNull(devices[0].rssi)
+        assertEquals("66:55:44:33:22:11", devices[1].address)
+        assertEquals(0x200404, devices[1].classOfDevice)
     }
 
     @Test
     fun parseInquiryResultWithRssiEvent() {
-        // Same layout as the standard result, RSSI bytes appended: 0xC4 = -60 dBm.
+        // 0x22, Num_Responses=1. The Reserved group is ONE byte here (it
+        // is two in 0x02): PSRM | Reserved(1) | CoD | Clock | RSSI.
+        // 0xC4 = -60 dBm. Regression test for the src15 shift: the old
+        // parser read the CoD one byte late (0x345A02) on this vector.
         val params = byteArrayOf(
             0x01,
             0xF6.toByte(), 0xE5.toByte(), 0xD4.toByte(), 0xC3.toByte(), 0xB2.toByte(), 0xA1.toByte(),
-            0x01, 0x00, 0x00,
+            0x01,
+            0x00,
             0x0C, 0x02, 0x5A,
             0x34, 0x12,
             0xC4.toByte(),
@@ -233,12 +256,49 @@ class HciProtocolTest {
         val devices = HciProtocol.parseInquiryResultWithRssi(HciProtocol.HciEvent(0x22, params))
         assertEquals(1, devices.size)
         assertEquals("A1:B2:C3:D4:E5:F6", devices[0].address)
+        assertEquals(0x5A020C, devices[0].classOfDevice)
         assertEquals(-60, devices[0].rssi)
+        assertNull(devices[0].name)
+    }
+
+    @Test
+    fun parseInquiryResultWithRssiMultiResponse() {
+        // 0x22, Num_Responses=2, Reserved group is 1 byte per response,
+        // RSSI group (one signed byte per response) comes last.
+        val params = byteArrayOf(
+            0x02,
+            // BD_ADDR group: A, then B.
+            0xF6.toByte(), 0xE5.toByte(), 0xD4.toByte(), 0xC3.toByte(), 0xB2.toByte(), 0xA1.toByte(),
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+            // Page_Scan_Repetition_Mode group.
+            0x01, 0x02,
+            // Reserved group (1 per response).
+            0x00, 0x00,
+            // Class_of_Device group: A = phone, B = 0x200404.
+            0x0C, 0x02, 0x5A,
+            0x04, 0x04, 0x20,
+            // Clock_Offset group.
+            0x34, 0x12,
+            0x78, 0x56,
+            // RSSI group: A = -60, B = -40.
+            0xC4.toByte(), 0xD8.toByte(),
+        )
+        val devices = HciProtocol.parseInquiryResultWithRssi(HciProtocol.HciEvent(0x22, params))
+        assertEquals(2, devices.size)
+        assertEquals("A1:B2:C3:D4:E5:F6", devices[0].address)
+        assertEquals(0x5A020C, devices[0].classOfDevice)
+        assertEquals(-60, devices[0].rssi)
+        assertEquals("66:55:44:33:22:11", devices[1].address)
+        assertEquals(0x200404, devices[1].classOfDevice)
+        assertEquals(-40, devices[1].rssi)
     }
 
     @Test
     fun parseExtendedInquiryResultEvent() {
-        // 0x2F | num=1 | BD_ADDR | PSRM | reserved | CoD | clock | RSSI | EIR(240)
+        // 0x2F, Num_Responses=1, assembled field-group by field-group:
+        // BD_ADDR | PSRM | Reserved(1) | CoD | Clock_Offset | RSSI | EIR(240).
+        // Num_Responses cannot exceed 1 in a real event: one response
+        // already fills the 255-byte HCI parameter limit.
         val eir = ByteArray(240)
         val name = "Pixel 9".toByteArray(Charsets.UTF_8)
         eir[0] = (name.size + 1).toByte() // structure length includes the type byte
@@ -250,8 +310,9 @@ class HciProtocolTest {
             0xF6.toByte(), 0xE5.toByte(), 0xD4.toByte(), 0xC3.toByte(), 0xB2.toByte(), 0xA1.toByte(),
         ).copyInto(params, 1)
         params[7] = 0x01 // page scan repetition mode
-        params[8] = 0x00 // reserved
-        params[9] = 0x0C; params[10] = 0x02; params[11] = 0x5A // CoD
+        params[8] = 0x00 // reserved (1 byte, as in 0x22)
+        params[9] = 0x0C; params[10] = 0x02; params[11] = 0x5A // CoD 0x5A020C
+        params[12] = 0x34; params[13] = 0x12 // clock offset
         params[14] = 0xBE.toByte() // RSSI = -66
         eir.copyInto(params, 15)
         val devices = HciProtocol.parseExtendedInquiryResult(HciProtocol.HciEvent(0x2F, params))
@@ -282,15 +343,31 @@ class HciProtocolTest {
         )
         assertNull(HciProtocol.parseInquiryComplete(HciProtocol.HciEvent(0x01, ByteArray(0))))
         assertNull(HciProtocol.parseInquiryComplete(HciProtocol.HciEvent(0x02, byteArrayOf(0x00))))
-        // Declared two responses but only one full record: keep the complete one.
-        val params = ByteArray(1 + 14)
-        params[0] = 0x02
-        byteArrayOf(
+        // The two-response 0x02 vector from parseInquiryResultMultiResponse
+        // with the final byte (second response's Clock_Offset high byte)
+        // missing: only the fully present first response survives.
+        val full = byteArrayOf(
+            0x02,
             0xF6.toByte(), 0xE5.toByte(), 0xD4.toByte(), 0xC3.toByte(), 0xB2.toByte(), 0xA1.toByte(),
-        ).copyInto(params, 1)
-        assertEquals(1, HciProtocol.parseInquiryResult(HciProtocol.HciEvent(0x02, params)).size)
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+            0x01, 0x02,
+            0x00, 0x00, 0x00, 0x00,
+            0x0C, 0x02, 0x5A,
+            0x04, 0x04, 0x20,
+            0x34, 0x12,
+            0x78, 0x56,
+        )
+        val truncated = full.copyOf(full.size - 1)
+        val kept = HciProtocol.parseInquiryResult(HciProtocol.HciEvent(0x02, truncated))
+        assertEquals(1, kept.size)
+        assertEquals("A1:B2:C3:D4:E5:F6", kept[0].address)
+        assertEquals(0x5A020C, kept[0].classOfDevice)
+        // Only the BD_ADDR group present (declared 2 responses): no field
+        // group after it exists, so nothing is complete enough to report.
+        val addrOnly = full.copyOf(1 + 12)
+        assertEquals(0, HciProtocol.parseInquiryResult(HciProtocol.HciEvent(0x02, addrOnly)).size)
         // Wrong event codes parse to nothing.
-        assertEquals(0, HciProtocol.parseInquiryResult(HciProtocol.HciEvent(0x22, params)).size)
-        assertEquals(0, HciProtocol.parseExtendedInquiryResult(HciProtocol.HciEvent(0x02, params)).size)
+        assertEquals(0, HciProtocol.parseInquiryResult(HciProtocol.HciEvent(0x22, full)).size)
+        assertEquals(0, HciProtocol.parseExtendedInquiryResult(HciProtocol.HciEvent(0x02, full)).size)
     }
 }
