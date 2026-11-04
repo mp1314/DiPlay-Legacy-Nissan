@@ -596,9 +596,11 @@ class DiPlayActivity : ComponentActivity() {
         adbSwitches.clear()
         adbStatus = null
         val compact = isCompactLayout
-        // src18: 主页壁纸只改主页背景层——根布局贴缓存位图、滚动区改透明透出；
-        // 其他页面与纯黑选项（默认）保持原样。
-        val homeWallpaper = if (page == "home") HomeWallpaper.preference(this) else HomeWallpaper.BLACK
+        // src20: 壁纸从主页扩展到本 Activity 的全部页面——每个页面的根视图统一贴同一张
+        // 壁纸、滚动区改透明透出；纯黑选项（默认）时各页面与 src19 逐像素一致。
+        // CarPlay 投屏是独立的 CarPlayHostActivity（openProjection 单独启动），
+        // 不在本 Activity 的渲染路径内，永远不会被贴壁纸。
+        val homeWallpaper = HomeWallpaper.preference(this)
         val scroll = ScrollView(this).apply {
             setBackgroundColor(if (homeWallpaper == HomeWallpaper.BLACK) BG else Color.TRANSPARENT)
             isFillViewport = true; clipToPadding = false
@@ -610,7 +612,7 @@ class DiPlayActivity : ComponentActivity() {
         val root: View = if (page == "settings" && isExpandedSettingsLayout) {
             content.setPadding(0, 0, 0, dp(32))
             settingsCategoryContent(content)
-            expandedSettingsShell(header, scroll)
+            expandedSettingsShell(header, scroll, homeWallpaper)
         } else {
             if (compact) content.setPadding(dp(12), dp(10), dp(12), dp(12))
             else content.setPadding(dp(32), dp(24), dp(32), dp(32))
@@ -647,6 +649,11 @@ class DiPlayActivity : ComponentActivity() {
                     "btpair" -> btPairPage(content)
                     "about" -> about(content)
                     else -> home(content)
+                }
+                // src20: 普通页面（连接/设置/配对/关于）的根就是滚动区本身，
+                // 非纯黑时把壁纸贴在滚动区上，内容列本身透明、直接透出。
+                if (homeWallpaper != HomeWallpaper.BLACK) {
+                    scroll.background = HomeWallpaperDrawable(this@DiPlayActivity, homeWallpaper)
                 }
                 scroll
             }
@@ -1740,8 +1747,11 @@ class DiPlayActivity : ComponentActivity() {
     }
 
     // Only the category scrolls, so the rail keeps showing where the driver is.
-    private fun expandedSettingsShell(header: View, categoryScroll: ScrollView): LinearLayout = column().apply {
-        setBackgroundColor(BG)
+    private fun expandedSettingsShell(header: View, categoryScroll: ScrollView, wallpaper: Int): LinearLayout = column().apply {
+        // src20: 展开式设置的根外壳与其它页面共用壁纸（分类栏滚动区本身无背景、透出外壳）；
+        // 纯黑时仍刷 BG，与 src19 一致。
+        if (wallpaper == HomeWallpaper.BLACK) setBackgroundColor(BG)
+        else background = HomeWallpaperDrawable(this@DiPlayActivity, wallpaper)
         setPadding(dp(32), dp(24), dp(32), 0)
         addView(header)
         addView(space(24))

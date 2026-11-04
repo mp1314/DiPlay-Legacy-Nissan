@@ -27,8 +27,9 @@ import kotlin.random.Random
  * src18: 主页壁纸，共 9 个选项。0-4 为代码绘制（配色与纹理照预览脚本
  * render_wallpapers.py 的 draw_bg 四个分支，基准画布 1024x600）；5-8 为内置二次元
  * 插画（assets/wallpapers 下的 webp 原文件），照 render_anime.py 做 cover 取景 +
- * 压暗 + 左侧暗角后烘进缓存位图。壁纸只作用于主页背景层；卡片、按钮、功能栏与
- * 文字颜色都不动。默认 0=纯黑，与 src17 的主页完全一致。
+ * 压暗 + 左侧暗角后烘进缓存位图。src20 起壁纸作用于 DiPlayActivity 的全部页面根
+ * 背景（主页/设置/连接/配对/关于）；卡片、按钮、功能栏与文字颜色都不动。CarPlay
+ * 投屏是独立的 CarPlayHostActivity，不在此列。默认 0=纯黑，各页面与 src19 一致。
  */
 object HomeWallpaper {
     const val BLACK = 0
@@ -370,7 +371,7 @@ internal object HomeWallpaperCache {
     }
 }
 
-/** 主页根布局的背景：按自身边界尺寸取缓存位图 1:1 贴图（只持有 applicationContext）。 */
+/** 页面根布局的背景：按自身边界尺寸取缓存位图 1:1 贴图（只持有 applicationContext）。 */
 internal class HomeWallpaperDrawable(context: Context, private val style: Int) : Drawable() {
     private val appContext: Context = context.applicationContext
 
